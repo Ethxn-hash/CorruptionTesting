@@ -1,0 +1,365 @@
+# Normalized Image Corruption Severity Formulas
+
+This experiment uses three image corruptions:
+
+1. Motion blur
+2. Lighting variation
+3. Altitude / resolution degradation
+
+Each corruption uses the same normalized severity scale:
+
+S ∈ [0, 100]
+
+where:
+
+S = 0 means the original clean image.
+
+S = 100 means maximum corruption, where the image should be strongly degraded and difficult to identify.
+
+The generated severity levels are:
+
+S = 0, 5, 10, 15, ..., 100
+
+For linear normalized severity, define:
+
+alpha = S / 100
+
+This means:
+
+alpha = 0.00 when S = 0
+
+alpha = 0.50 when S = 50
+
+alpha = 1.00 when S = 100
+
+The purpose of using this shared severity scale is to make the corruption levels consistent across all three corruption types. Each corruption moves linearly from the clean image toward its maximum degraded version.
+
+---
+
+# 1. Motion Blur
+
+## Variables
+
+H = image height in pixels
+
+W = image width in pixels
+
+m = min(H, W)
+
+S = severity level from 0 to 100
+
+f_blur = maximum blur fraction
+
+L_max = maximum blur kernel size
+
+k(S) = motion blur kernel size at severity S
+
+theta = motion blur angle
+
+I = original image
+
+I_S = corrupted image at severity S
+
+## Formula
+
+First define the shorter image dimension:
+
+m = min(H, W)
+
+Then define the maximum blur length:
+
+L_max = nearest odd integer(f_blur * m)
+
+The motion blur kernel size at severity S is:
+
+k(S) = nearest odd integer(1 + (L_max - 1) * (S / 100))
+
+The corrupted image is produced by convolving the original image with a normalized linear motion blur kernel:
+
+I_S = I * K_{k(S), theta}
+
+where K_{k(S), theta} is a linear motion blur kernel with length k(S) and angle theta.
+
+## Recommended Parameter
+
+f_blur = 0.30
+
+This means that at severity 100, the motion blur kernel length is approximately 30% of the shorter image dimension.
+
+For example, if the image is 512 x 512:
+
+m = 512
+
+L_max = nearest odd integer(0.30 * 512)
+
+L_max = nearest odd integer(153.6)
+
+L_max = 155
+
+So at severity 100, the blur kernel is about 155 pixels long.
+
+## Explanation
+
+Motion blur simulates the effect of UAV movement or camera motion during image capture. A longer blur kernel smears the image across more pixels, which destroys edges, lesion details, and texture information.
+
+At S = 0:
+
+k(0) = nearest odd integer(1 + (L_max - 1) * 0)
+
+k(0) = 1
+
+A kernel size of 1 means no blur, so the image stays unchanged.
+
+At S = 100:
+
+k(100) = nearest odd integer(1 + (L_max - 1) * 1)
+
+k(100) = L_max
+
+This applies the maximum blur.
+
+Using m = min(H, W) makes the blur severity relative to the image size instead of using a fixed pixel value. This helps keep severity comparable across images with different resolutions.
+
+The kernel size is forced to be odd because odd-sized kernels have a clear center pixel, which makes convolution cleaner and more stable.
+
+---
+
+# 2. Lighting Variation
+
+## Variables
+
+H = image height in pixels
+
+W = image width in pixels
+
+x = horizontal pixel coordinate
+
+y = vertical pixel coordinate
+
+S = severity level from 0 to 100
+
+alpha = normalized severity strength
+
+P(x, y) = spatial lighting pattern
+
+B(x, y) = sharpened lighting split
+
+T(x, y) = target lighting multiplier
+
+M_S(x, y) = severity-adjusted lighting multiplier
+
+M_min = minimum lighting multiplier
+
+M_max = maximum lighting multiplier
+
+q = sharpness value
+
+I(x, y) = original pixel value at location (x, y)
+
+I_S(x, y) = corrupted pixel value at location (x, y)
+
+## Formula
+
+First define normalized severity:
+
+alpha = S / 100
+
+For the default diagonal lighting pattern:
+
+P(x, y) = 0.5 * (x / (W - 1) + y / (H - 1))
+
+This creates a smooth pattern from one side of the image to the other, with values between 0 and 1.
+
+To make the lighting corruption more severe, the pattern is passed through a sigmoid function:
+
+B(x, y) = 1 / (1 + exp(-q * (P(x, y) - 0.5)))
+
+The target lighting multiplier is:
+
+T(x, y) = M_min + (M_max - M_min) * B(x, y)
+
+The severity-adjusted multiplier is:
+
+M_S(x, y) = (1 - alpha) + alpha * T(x, y)
+
+The corrupted image is:
+
+I_S(x, y) = clip(I(x, y) * M_S(x, y), 0, 255)
+
+## Recommended Parameters
+
+M_min = 0.00
+
+M_max = 6.00
+
+q = 12.0
+
+## Explanation
+
+Lighting variation simulates uneven illumination in UAV images, such as shadows, glare, overexposure, or strong sunlight differences across a plant or field image.
+
+The value P(x, y) creates a spatial lighting pattern. In the default diagonal pattern, one side of the image moves toward darker lighting and the other side moves toward brighter lighting.
+
+The sigmoid function:
+
+B(x, y) = 1 / (1 + exp(-q * (P(x, y) - 0.5)))
+
+makes the lighting effect more severe than a simple smooth gradient. Instead of changing gradually across the entire image, it creates a sharper transition between dark and bright regions.
+
+The parameter q controls the sharpness of the transition.
+
+A smaller q creates a smoother gradient.
+
+A larger q creates a harsher shadow/highlight split.
+
+The target multiplier T(x, y) controls how dark or bright each area becomes.
+
+When M_min = 0.00, some regions can become completely black.
+
+When M_max = 6.00, bright regions can become heavily overexposed and clipped to 255.
+
+The final multiplier M_S(x, y) blends between the clean image and the full lighting corruption.
+
+At S = 0:
+
+alpha = 0
+
+M_S(x, y) = 1
+
+I_S(x, y) = I(x, y)
+
+So the image is unchanged.
+
+At S = 100:
+
+alpha = 1
+
+M_S(x, y) = T(x, y)
+
+So the full severe lighting corruption is applied.
+
+The clipping operation keeps pixel values in the valid image range from 0 to 255. It also simulates real overexposure, where details are lost because bright regions become pure white.
+
+---
+
+# 3. Altitude / Resolution Degradation
+
+## Variables
+
+H = image height in pixels
+
+W = image width in pixels
+
+S = severity level from 0 to 100
+
+alpha = normalized severity strength
+
+c(S) = resolution scale factor at severity S
+
+c_min = minimum resolution scale factor
+
+I = original image
+
+I_small = downsampled image
+
+I_S = corrupted image at severity S
+
+## Formula
+
+First define normalized severity:
+
+alpha = S / 100
+
+The resolution scale factor is:
+
+c(S) = 1 - (1 - c_min) * (S / 100)
+
+The image is first downsampled to:
+
+I_small = resize(I, c(S) * W, c(S) * H)
+
+Then it is resized back to the original size:
+
+I_S = resize(I_small, W, H)
+
+## Recommended Parameter
+
+c_min = 0.03
+
+This means that at severity 100, the image is reduced to 3% of its original width and 3% of its original height before being resized back to the original dimensions.
+
+For example, if the image is 512 x 512:
+
+At S = 100:
+
+c(100) = 0.03
+
+New width = 512 * 0.03 = 15.36
+
+New height = 512 * 0.03 = 15.36
+
+So the image is reduced to about 15 x 15 pixels, then enlarged back to 512 x 512.
+
+## Explanation
+
+Altitude / resolution degradation simulates the effect of a UAV flying farther away from the plant or field target. As altitude increases, the plant occupies fewer pixels in the image. Fine details such as disease spots, leaf edges, color transitions, and texture patterns become harder to detect.
+
+The scale factor c(S) decreases linearly as severity increases.
+
+At S = 0:
+
+c(0) = 1 - (1 - c_min) * 0
+
+c(0) = 1
+
+So the image stays at full resolution.
+
+At S = 100:
+
+c(100) = 1 - (1 - c_min) * 1
+
+c(100) = c_min
+
+So the image is reduced to the minimum resolution.
+
+The image is resized back to the original size after downsampling so that all corrupted images keep the same dimensions as the original image. This isolates the effect of lost visual detail without changing the final image size.
+
+---
+
+# Summary of Final Parameters
+
+Motion blur:
+
+f_blur = 0.30
+
+k(S) = nearest odd integer(1 + (L_max - 1) * (S / 100))
+
+Lighting variation:
+
+M_min = 0.00
+
+M_max = 6.00
+
+q = 12.0
+
+alpha = S / 100
+
+Resolution degradation:
+
+c_min = 0.03
+
+c(S) = 1 - (1 - c_min) * (S / 100)
+
+---
+
+# Severity Normalization
+
+All three corruption types use the same normalized severity scale from 0 to 100.
+
+S = 0 means no corruption.
+
+S = 100 means the maximum corruption endpoint.
+
+Each severity step increases the corruption parameter linearly. This makes the experimental design easier to explain, reproduce, and compare across motion blur, lighting variation, and altitude / resolution degradation.
+
+However, even though the corruption parameters are linear, the visual effect and model performance drop may not be perfectly linear. For example, a small change in lighting may not affect classification much, while a similar normalized change in blur or resolution may cause a larger accuracy drop. This is expected because different corruptions damage different types of image information.
