@@ -1,297 +1,538 @@
 import argparse
-from pathlib import Path
+import math
+import os
 
 import cv2
 import numpy as np
 
-
-IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
-
-
-def clamp(value, low, high):
-    return max(low, min(high, value))
+import normalized_severity as ns
 
 
-def parse_severities(severity_text, severity_step):
-    if severity_text:
-        severities = [float(x.strip()) for x in severity_text.split(",") if x.strip()]
-    else:
-        severities = list(range(0, 101, severity_step))
-        if severities[-1] != 100:
-            severities.append(100)
-
-    for s in severities:
-        if s < 0 or s > 100:
-            raise ValueError(f"Severity must be in [0, 100], got {s}")
-
-    return severities
+SEVERITIES = getattr(
+    ns,
+    "SEVERITIES",
+    list(range(0, 101, 10)),
+)
 
 
-def severity_string(severity):
-    if float(severity).is_integer():
-        return str(int(severity))
-    return str(severity).replace(".", "p")
+def read_image(path):
+    """
+    Read an image as a three-channel BGR image.
+    """
 
+    image = cv2.imread(path, cv2.IMREAD_COLOR)
 
-def collect_images(input_path):
-    input_path = Path(input_path)
-
-    if input_path.is_file():
-        if input_path.suffix.lower() not in IMAGE_EXTENSIONS:
-            raise ValueError(f"Unsupported image file: {input_path}")
-        return [input_path]
-
-    if input_path.is_dir():
-        return sorted(
-            p for p in input_path.rglob("*")
-            if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
+    if image is None:
+        raise FileNotFoundError(
+            f"Could not read image: {path}\n"
+            "Check the path, filename, and extension."
         )
 
-    raise FileNotFoundError(f"Input path does not exist: {input_path}")
+    return image
 
 
-def build_output_path(image_path, input_path, output_dir, output_name):
-    input_path = Path(input_path)
-    output_dir = Path(output_dir)
-
-    if input_path.is_dir():
-        relative_parent = image_path.parent.relative_to(input_path)
-        final_dir = output_dir / relative_parent
-    else:
-        final_dir = output_dir
-
-    final_dir.mkdir(parents=True, exist_ok=True)
-    return final_dir / output_name
+def ensure_directory(path):
+    os.makedirs(path, exist_ok=True)
 
 
-def lighting_pattern(height, width, pattern="diagonal"):
+def ensure_bgr(image):
     """
-    Creates P(x,y), a spatial pattern in [0,1].
-
-    diagonal:
-        dark-to-bright from top-left to bottom-right
-
-    horizontal:
-        dark-to-bright from left to right
-
-    vertical:
-        dark-to-bright from top to bottom
-
-    radial:
-        brighter center, darker edges
-
-    vignette:
-        darker center, brighter edges
+    Guarantee that an image has exactly three BGR channels.
     """
-    x = np.linspace(0, 1, width, dtype=np.float32)
-    y = np.linspace(0, 1, height, dtype=np.float32)
-    xx, yy = np.meshgrid(x, y)
 
-    if pattern == "diagonal":
-        p = 0.5 * (xx + yy)
+    if image.ndim == 2:
+        return cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
 
-    elif pattern == "horizontal":
-        p = xx
+    if image.ndim == 3:
+        if image.shape[2] == 1:
+            return cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
 
-    elif pattern == "vertical":
-        p = yy
+        if image.shape[2] == 4:
+            return cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
 
-    elif pattern == "radial":
-        distance = np.sqrt((xx - 0.5) ** 2 + (yy - 0.5) ** 2)
-        max_distance = np.sqrt(0.5 ** 2 + 0.5 ** 2)
-        p = 1.0 - distance / max_distance
+        if image.shape[2] == 3:
+            return image
 
-    elif pattern == "vignette":
-        distance = np.sqrt((xx - 0.5) ** 2 + (yy - 0.5) ** 2)
-        max_distance = np.sqrt(0.5 ** 2 + 0.5 ** 2)
-        p = distance / max_distance
+    raise ValueError(
+        f"Unsupported image shape: {image.shape}"
+    )
 
+
+def force_odd(value):
+    """
+    Convert a number to a positive odd integer.
+    """
+
+    value = max(3, int(round(value)))
+
+    if value % 2 == 0:
+        value += 1
+
+    return value
+
+
+def create_lighting_map(image):
+    """
+    Create a smooth illumination map using the image's existing luminance.
+
+    Broad bright regions receive positive values.
+    Broad dark regions receive negative values.
+
+    Returns:
+        normalized_map:
+            Luminance values normalized to approximately 0–1.
+
+        signed_map:
+            Dark regions near -1 and bright regions near +1.
+    """
+
+    image = ensure_bgr(image)
+
+    height, width = image.shape[:2]
+    minimum_dimension = min(height, width)
+
+    lab = cv2.cvtColor(
+        image,
+        cv2.COLOR_BGR2LAB,
+    )
+
+    luminance = (
+        lab[:, :, 0].astype(np.float32) / 255.0
+    )
+
+    # Broad smoothing helps the corruption follow realistic illumination
+    # regions rather than individual leaf edges or pixel noise.
+    sigma = float(
+        np.clip(
+            minimum_dimension * 0.035,
+            3.0,
+            35.0,
+        )
+    )
+
+    kernel_size = force_odd(
+        6.0 * sigma + 1.0
+    )
+
+    smoothed = cv2.GaussianBlur(
+        luminance,
+        (kernel_size, kernel_size),
+        sigmaX=sigma,
+        sigmaY=sigma,
+        borderType=cv2.BORDER_REFLECT101,
+    )
+
+    # Percentile normalization prevents isolated extreme pixels from
+    # controlling the entire lighting map.
+    low = float(np.percentile(smoothed, 2))
+    high = float(np.percentile(smoothed, 98))
+
+    if high - low < 1e-6:
+        normalized_map = np.full_like(
+            smoothed,
+            0.5,
+            dtype=np.float32,
+        )
     else:
-        raise ValueError(
-            "pattern must be diagonal, horizontal, vertical, radial, or vignette"
+        normalized_map = (
+            smoothed - low
+        ) / (
+            high - low
         )
 
-    return np.clip(p, 0, 1).astype(np.float32)
+        normalized_map = np.clip(
+            normalized_map,
+            0.0,
+            1.0,
+        ).astype(np.float32)
+
+    signed_map = (
+        2.0 * normalized_map - 1.0
+    ).astype(np.float32)
+
+    return normalized_map, signed_map
 
 
-def apply_lighting_variation(
+def apply_lighting_degradation(image, severity):
+    """
+    Apply harsh illumination corruption.
+
+    Behavior:
+        Severity 0:
+            Original image.
+
+        Increasing severity:
+            Existing bright regions move toward white.
+            Existing dark regions move toward black.
+
+        Severity 100:
+            A pure black-and-white, three-channel BGR image.
+
+    The parameter values are obtained from normalized_severity.py.
+    """
+
+    image = ensure_bgr(image)
+
+    severity = float(
+        np.clip(severity, 0, 100)
+    )
+
+    if severity <= 0:
+        return image.copy(), 0.0, 0.0
+
+    push = float(
+        ns.get_lighting_push(severity)
+    )
+
+    bw_blend = float(
+        ns.get_lighting_bw_blend(severity)
+    )
+
+    push = float(
+        np.clip(push, 0.0, 1.5)
+    )
+
+    bw_blend = float(
+        np.clip(bw_blend, 0.0, 1.0)
+    )
+
+    image_float = image.astype(np.float32)
+
+    normalized_map, signed_map = (
+        create_lighting_map(image)
+    )
+
+    # Strengthen middle-valued regions slightly so changes are visible
+    # throughout the severity sequence.
+    region_strength = (
+        np.abs(signed_map) ** 0.55
+    ).astype(np.float32)
+
+    # Convert maps from H x W to H x W x 1.
+    signed_map_3 = signed_map[:, :, None]
+    strength_3 = region_strength[:, :, None]
+
+    bright_weight = (
+        np.clip(
+            signed_map_3,
+            0.0,
+            1.0,
+        )
+        * strength_3
+    )
+
+    dark_weight = (
+        np.clip(
+            -signed_map_3,
+            0.0,
+            1.0,
+        )
+        * strength_3
+    )
+
+    # Bright regions move toward white.
+    bright_change = (
+        push
+        * bright_weight
+        * (255.0 - image_float)
+    )
+
+    # Dark regions move toward black.
+    dark_change = (
+        push
+        * dark_weight
+        * image_float
+    )
+
+    illumination_image = (
+        image_float
+        + bright_change
+        - dark_change
+    )
+
+    illumination_image = np.clip(
+        illumination_image,
+        0.0,
+        255.0,
+    )
+
+    # Create a two-dimensional black-and-white target.
+    binary_mask = normalized_map >= 0.5
+
+    binary_gray = np.where(
+        binary_mask,
+        255.0,
+        0.0,
+    ).astype(np.float32)
+
+    # Convert H x W grayscale target into H x W x 3.
+    binary_target = np.repeat(
+        binary_gray[:, :, None],
+        3,
+        axis=2,
+    )
+
+    # Gradually transition toward the black-and-white endpoint.
+    corrupted = (
+        (1.0 - bw_blend) * illumination_image
+        + bw_blend * binary_target
+    )
+
+    if severity >= 100:
+        # Guarantee severity 100 contains only black and white and
+        # remains a three-channel BGR image.
+        corrupted = binary_target.copy()
+
+    corrupted = np.clip(
+        corrupted,
+        0.0,
+        255.0,
+    ).astype(np.uint8)
+
+    corrupted = ensure_bgr(corrupted)
+
+    return corrupted, push, bw_blend
+
+
+def resize_for_cell(
     image,
-    severity,
-    min_multiplier=0.00,
-    max_multiplier=6.00,
-    sharpness=12.0,
-    pattern="diagonal"
+    available_width,
+    available_height,
 ):
     """
-    Severe normalized lighting corruption.
-
-    Severity:
-        S in [0, 100]
-
-    Linear severity strength:
-        alpha = S / 100
-
-    Spatial pattern:
-        P(x,y) in [0,1]
-
-    Harsh lighting split:
-        B(x,y) = 1 / (1 + exp(-sharpness * (P(x,y) - 0.5)))
-
-    Target multiplier:
-        T(x,y) = M_min + (M_max - M_min) * B(x,y)
-
-    Final multiplier:
-        M_S(x,y) = (1 - alpha) + alpha * T(x,y)
-
-    Corrupted image:
-        I_S(x,y) = clip(I(x,y) * M_S(x,y), 0, 255)
-
-    At S = 0:
-        alpha = 0, so image is unchanged.
-
-    At S = 100:
-        alpha = 1, so the full severe lighting corruption is applied.
+    Resize an image while preserving its aspect ratio.
     """
+
+    image = ensure_bgr(image)
 
     height, width = image.shape[:2]
 
-    severity = clamp(severity, 0, 100)
-    alpha = severity / 100.0
+    scale = min(
+        available_width / width,
+        available_height / height,
+    )
 
-    p = lighting_pattern(height, width, pattern)
+    new_width = max(
+        1,
+        int(round(width * scale)),
+    )
 
-    # Sigmoid creates a harsher dark/bright split than a smooth gradient.
-    b = 1.0 / (1.0 + np.exp(-sharpness * (p - 0.5)))
+    new_height = max(
+        1,
+        int(round(height * scale)),
+    )
 
-    target_multiplier = min_multiplier + (max_multiplier - min_multiplier) * b
+    interpolation = (
+        cv2.INTER_AREA
+        if scale < 1.0
+        else cv2.INTER_NEAREST
+    )
 
-    multiplier = (1.0 - alpha) + alpha * target_multiplier
+    resized = cv2.resize(
+        image,
+        (new_width, new_height),
+        interpolation=interpolation,
+    )
 
-    if image.ndim == 3:
-        multiplier = multiplier[:, :, None]
+    return ensure_bgr(resized)
 
-    corrupted = image.astype(np.float32) * multiplier
-    corrupted = np.clip(corrupted, 0, 255).astype(np.uint8)
 
-    return corrupted
+def create_contact_sheet(
+    labeled_images,
+    columns=3,
+    cell_width=300,
+    cell_height=260,
+):
+    """
+    Create a contact sheet from three-channel BGR images.
+    """
+
+    rows = math.ceil(
+        len(labeled_images) / columns
+    )
+
+    sheet = np.full(
+        (
+            rows * cell_height,
+            columns * cell_width,
+            3,
+        ),
+        255,
+        dtype=np.uint8,
+    )
+
+    for index, (label, image) in enumerate(
+        labeled_images
+    ):
+        image = ensure_bgr(image)
+
+        row = index // columns
+        column = index % columns
+
+        x_start = column * cell_width
+        y_start = row * cell_height
+
+        preview = resize_for_cell(
+            image,
+            available_width=cell_width - 20,
+            available_height=cell_height - 55,
+        )
+
+        preview = ensure_bgr(preview)
+
+        preview_height, preview_width = (
+            preview.shape[:2]
+        )
+
+        x_offset = (
+            x_start
+            + (cell_width - preview_width) // 2
+        )
+
+        y_offset = (
+            y_start
+            + 42
+            + (
+                cell_height
+                - 42
+                - preview_height
+            ) // 2
+        )
+
+        destination = sheet[
+            y_offset:y_offset + preview_height,
+            x_offset:x_offset + preview_width,
+        ]
+
+        if destination.shape != preview.shape:
+            raise ValueError(
+                "Contact-sheet shape mismatch:\n"
+                f"Destination: {destination.shape}\n"
+                f"Preview: {preview.shape}"
+            )
+
+        destination[:] = preview
+
+        cv2.putText(
+            sheet,
+            label,
+            (x_start + 8, y_start + 27),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.48,
+            (0, 0, 0),
+            1,
+            cv2.LINE_AA,
+        )
+
+    return sheet
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate severe normalized lighting variation corruptions."
+        description=(
+            "Generate normalized harsh-illumination "
+            "corruption at severities 0, 10, ..., 100."
+        )
     )
 
     parser.add_argument(
-        "--input",
-        required=True,
-        help="Input image or folder."
+        "image",
+        help="Path to the input image.",
     )
 
     parser.add_argument(
-        "--output",
-        required=True,
-        help="Output folder."
-    )
-
-    parser.add_argument(
-        "--severity-step",
-        type=int,
-        default=5,
-        help="Generate severity levels from 0 to 100 by this step. Default is 5."
-    )
-
-    parser.add_argument(
-        "--severities",
-        default=None,
-        help="Optional list like 0,25,50,75,100."
-    )
-
-    parser.add_argument(
-        "--min-multiplier",
-        type=float,
-        default=0.00,
-        help="Darkest lighting multiplier at severity 100. Default is 0.00."
-    )
-
-    parser.add_argument(
-        "--max-multiplier",
-        type=float,
-        default=6.00,
-        help="Brightest lighting multiplier at severity 100. Default is 6.00."
-    )
-
-    parser.add_argument(
-        "--sharpness",
-        type=float,
-        default=12.0,
-        help="Higher value creates a sharper dark/bright split. Default is 12.0."
-    )
-
-    parser.add_argument(
-        "--pattern",
-        default="diagonal",
-        choices=["diagonal", "horizontal", "vertical", "radial", "vignette"],
-        help="Lighting pattern. Default is diagonal."
+        "--output_dir",
+        default="lighting_test",
+        help=(
+            "Directory used to save generated images. "
+            "Default: lighting_test"
+        ),
     )
 
     args = parser.parse_args()
 
-    input_path = Path(args.input)
-    output_dir = Path(args.output)
+    image = read_image(args.image)
+    ensure_directory(args.output_dir)
 
-    severities = parse_severities(args.severities, args.severity_step)
-    image_paths = collect_images(input_path)
+    base_name = os.path.splitext(
+        os.path.basename(args.image)
+    )[0]
 
-    print(f"Input path: {input_path}")
-    print(f"Output folder: {output_dir}")
-    print(f"Found {len(image_paths)} image(s).")
+    contact_images = []
 
-    if len(image_paths) == 0:
-        print("No images found. Check your input path and file extensions.")
-        return
+    for severity in SEVERITIES:
+        corrupted, push, bw_blend = (
+            apply_lighting_degradation(
+                image,
+                severity,
+            )
+        )
 
-    count = 0
+        output_name = (
+            f"{base_name}_lighting_"
+            f"s{int(severity):03d}.png"
+        )
 
-    for image_path in image_paths:
-        image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+        output_path = os.path.join(
+            args.output_dir,
+            output_name,
+        )
 
-        if image is None:
-            print(f"Skipping unreadable image: {image_path}")
-            continue
+        success = cv2.imwrite(
+            output_path,
+            corrupted,
+        )
 
-        for severity in severities:
-            corrupted = apply_lighting_variation(
-                image=image,
-                severity=severity,
-                min_multiplier=args.min_multiplier,
-                max_multiplier=args.max_multiplier,
-                sharpness=args.sharpness,
-                pattern=args.pattern
+        if not success:
+            raise IOError(
+                f"Failed to save: {output_path}"
             )
 
-            s_text = severity_string(severity)
+        parameter_text = (
+            f"push={push:.2f}, "
+            f"BW={bw_blend:.2f}"
+        )
 
-            output_name = (
-                f"{image_path.stem}"
-                f"_lighting_s{s_text}"
-                f"_min{str(args.min_multiplier).replace('.', 'p')}"
-                f"_max{str(args.max_multiplier).replace('.', 'p')}"
-                f"_sh{str(args.sharpness).replace('.', 'p')}"
-                f"{image_path.suffix}"
-            )
+        label = (
+            f"Severity {int(severity)} | "
+            f"{parameter_text}"
+        )
 
-            output_path = build_output_path(
-                image_path=image_path,
-                input_path=input_path,
-                output_dir=output_dir,
-                output_name=output_name
-            )
+        contact_images.append(
+            (label, corrupted)
+        )
 
-            cv2.imwrite(str(output_path), corrupted)
-            print(f"Saved: {output_path}")
-            count += 1
+        print(
+            f"Saved severity {int(severity)}: "
+            f"{output_path} "
+            f"({parameter_text}, "
+            f"shape={corrupted.shape})"
+        )
 
-    print(f"\nDone. Generated {count} images.")
+    contact_sheet = create_contact_sheet(
+        contact_images
+    )
+
+    contact_sheet_path = os.path.join(
+        args.output_dir,
+        f"{base_name}_lighting_contact_sheet.png",
+    )
+
+    success = cv2.imwrite(
+        contact_sheet_path,
+        contact_sheet,
+    )
+
+    if not success:
+        raise IOError(
+            f"Failed to save contact sheet: "
+            f"{contact_sheet_path}"
+        )
+
+    print(
+        f"\nContact sheet: "
+        f"{contact_sheet_path}"
+    )
 
 
 if __name__ == "__main__":

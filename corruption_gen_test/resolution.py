@@ -1,156 +1,255 @@
 import argparse
-from pathlib import Path
+import math
+import os
 
 import cv2
+import numpy as np
+
+import normalized_severity as ns
 
 
-IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
+SEVERITIES = getattr(ns, "SEVERITIES", list(range(0, 101, 10)))
 
 
-def clamp(value, low, high):
-    return max(low, min(high, value))
+def read_image(path):
+    image = cv2.imread(path, cv2.IMREAD_COLOR)
 
-
-def parse_severities(severity_text, severity_step):
-    if severity_text:
-        severities = [float(x.strip()) for x in severity_text.split(",") if x.strip()]
-    else:
-        severities = list(range(0, 101, severity_step))
-        if severities[-1] != 100:
-            severities.append(100)
-
-    for s in severities:
-        if s < 0 or s > 100:
-            raise ValueError(f"Severity must be in [0, 100], got {s}")
-    return severities
-
-
-def severity_string(severity):
-    if float(severity).is_integer():
-        return str(int(severity))
-    return str(severity).replace(".", "p")
-
-
-def float_to_filename(value, decimals=4):
-    return f"{value:.{decimals}f}".replace(".", "p")
-
-
-def collect_images(input_path):
-    input_path = Path(input_path)
-
-    if input_path.is_file():
-        if input_path.suffix.lower() not in IMAGE_EXTENSIONS:
-            raise ValueError(f"Unsupported image file: {input_path}")
-        return [input_path]
-
-    if input_path.is_dir():
-        return sorted(
-            p for p in input_path.rglob("*")
-            if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
+    if image is None:
+        raise FileNotFoundError(
+            f"Could not read image: {path}\n"
+            "Check the path, filename, and extension."
         )
 
-    raise FileNotFoundError(f"Input path does not exist: {input_path}")
+    return image
 
 
-def build_output_path(image_path, input_path, output_dir, output_name):
-    input_path = Path(input_path)
-    output_dir = Path(output_dir)
-
-    if input_path.is_dir():
-        relative_parent = image_path.parent.relative_to(input_path)
-        final_dir = output_dir / relative_parent
-    else:
-        final_dir = output_dir
-
-    final_dir.mkdir(parents=True, exist_ok=True)
-    return final_dir / output_name
+def ensure_directory(path):
+    os.makedirs(path, exist_ok=True)
 
 
-def resolution_scale_factor(severity, min_scale=0.03):
-    severity = clamp(severity, 0, 100)
-    scale = 1.0 - (1.0 - min_scale) * (severity / 100.0)
-    return clamp(scale, min_scale, 1.0)
+def apply_resolution_degradation(
+    image,
+    severity,
+    upsample_method="linear",
+):
+    """
+    Apply normalized resolution degradation.
 
+    Severity 0:
+        Original image.
 
-def apply_resolution_degradation(image, severity, min_scale=0.03, gamma=2.0,
-                                 upsample_method="linear"):
+    Severity 100:
+        Reduce to exactly 1 x 1 pixel and enlarge back.
+    """
+
+    severity = float(np.clip(severity, 0, 100))
+
+    if severity <= 0:
+        return image.copy(), 1.0, image.shape[1], image.shape[0]
+
     height, width = image.shape[:2]
 
-    scale = resolution_scale_factor(severity, min_scale=min_scale)
-
-    small_width = max(1, int(round(width * scale)))
-    small_height = max(1, int(round(height * scale)))
-
-    small = cv2.resize(
-        image,
-        (small_width, small_height),
-        interpolation=cv2.INTER_AREA
-    )
-
-    if upsample_method == "nearest":
-        interpolation = cv2.INTER_NEAREST
-    elif upsample_method == "linear":
-        interpolation = cv2.INTER_LINEAR
-    elif upsample_method == "cubic":
-        interpolation = cv2.INTER_CUBIC
+    if severity >= 100:
+        reduced_width = 1
+        reduced_height = 1
+        scale = 0.0
     else:
-        raise ValueError("upsample_method must be nearest, linear, or cubic")
+        scale = float(ns.get_resolution_scale(severity))
+        scale = float(np.clip(scale, 0.0, 1.0))
 
-    degraded = cv2.resize(
-        small,
-        (width, height),
-        interpolation=interpolation
+        reduced_width = max(
+            1,
+            int(round(width * scale)),
+        )
+
+        reduced_height = max(
+            1,
+            int(round(height * scale)),
+        )
+
+    reduced = cv2.resize(
+        image,
+        (reduced_width, reduced_height),
+        interpolation=cv2.INTER_AREA,
     )
 
-    return degraded, scale
+    interpolation_methods = {
+        "nearest": cv2.INTER_NEAREST,
+        "linear": cv2.INTER_LINEAR,
+        "cubic": cv2.INTER_CUBIC,
+    }
+
+    restored = cv2.resize(
+        reduced,
+        (width, height),
+        interpolation=interpolation_methods[upsample_method],
+    )
+
+    return restored, scale, reduced_width, reduced_height
+
+
+def resize_for_cell(image, available_width, available_height):
+    height, width = image.shape[:2]
+
+    scale = min(
+        available_width / width,
+        available_height / height,
+    )
+
+    new_width = max(1, round(width * scale))
+    new_height = max(1, round(height * scale))
+
+    interpolation = (
+        cv2.INTER_AREA if scale < 1.0
+        else cv2.INTER_NEAREST
+    )
+
+    return cv2.resize(
+        image,
+        (new_width, new_height),
+        interpolation=interpolation,
+    )
+
+
+def create_contact_sheet(
+    labeled_images,
+    columns=3,
+    cell_width=270,
+    cell_height=250,
+):
+    rows = math.ceil(len(labeled_images) / columns)
+
+    sheet = np.full(
+        (rows * cell_height, columns * cell_width, 3),
+        255,
+        dtype=np.uint8,
+    )
+
+    for index, (label, image) in enumerate(labeled_images):
+        row = index // columns
+        column = index % columns
+
+        x_start = column * cell_width
+        y_start = row * cell_height
+
+        preview = resize_for_cell(
+            image,
+            available_width=cell_width - 20,
+            available_height=cell_height - 50,
+        )
+
+        preview_height, preview_width = preview.shape[:2]
+
+        x_offset = x_start + (cell_width - preview_width) // 2
+        y_offset = y_start + 38 + (
+            cell_height - 38 - preview_height
+        ) // 2
+
+        sheet[
+            y_offset:y_offset + preview_height,
+            x_offset:x_offset + preview_width,
+        ] = preview
+
+        cv2.putText(
+            sheet,
+            label,
+            (x_start + 10, y_start + 27),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.54,
+            (0, 0, 0),
+            1,
+            cv2.LINE_AA,
+        )
+
+    return sheet
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate resolution degradation corruptions.")
-    parser.add_argument("--input", required=True, help="Input image or folder.")
-    parser.add_argument("--output", required=True, help="Output folder.")
-    parser.add_argument("--severity-step", type=int, default=5, help="Default: 5")
-    parser.add_argument("--severities", default=None, help="Optional list like 0,25,50,75,100")
-    parser.add_argument("--min-scale", type=float, default=0.03,
-                        help="Downsample factor at severity 100.")
-    parser.add_argument("--upsample-method", default="linear",
-                        choices=["nearest", "linear", "cubic"],
-                        help="Method used to resize back to original size.")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Generate normalized resolution degradation "
+            "for severity levels 0 through 100."
+        )
+    )
+
+    parser.add_argument(
+        "image",
+        help="Path to the input image.",
+    )
+
+    parser.add_argument(
+        "--output_dir",
+        default="resolution_test",
+        help="Output directory. Default: resolution_test",
+    )
+
+    parser.add_argument(
+        "--upsample_method",
+        choices=["nearest", "linear", "cubic"],
+        default="linear",
+        help="Method used to enlarge the reduced image.",
+    )
+
     args = parser.parse_args()
 
-    input_path = Path(args.input)
-    output_dir = Path(args.output)
-    severities = parse_severities(args.severities, args.severity_step)
-    image_paths = collect_images(input_path)
+    image = read_image(args.image)
+    ensure_directory(args.output_dir)
 
-    count = 0
+    base_name = os.path.splitext(
+        os.path.basename(args.image)
+    )[0]
 
-    for image_path in image_paths:
-        image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
-        if image is None:
-            print(f"Skipping unreadable image: {image_path}")
-            continue
+    contact_images = []
 
-        for severity in severities:
-            corrupted, scale = apply_resolution_degradation(
+    for severity in SEVERITIES:
+        corrupted, scale, reduced_width, reduced_height = (
+            apply_resolution_degradation(
                 image,
-                severity=severity,
-                min_scale=args.min_scale,   
-                upsample_method=args.upsample_method
+                severity,
+                upsample_method=args.upsample_method,
             )
+        )
 
-            s_text = severity_string(severity)
-            output_name = (
-                f"{image_path.stem}_resolution_s{s_text}"
-                f"_Sc{float_to_filename(scale, 4)}{image_path.suffix}"
+        output_name = (
+            f"{base_name}_resolution_s{int(severity):03d}"
+            f"_Sc{scale:.4f}.png"
+        )
+
+        output_path = os.path.join(
+            args.output_dir,
+            output_name,
+        )
+
+        if not cv2.imwrite(output_path, corrupted):
+            raise IOError(f"Failed to save: {output_path}")
+
+        parameter_text = (
+            f"{reduced_width}x{reduced_height}"
+        )
+
+        contact_images.append(
+            (
+                f"Severity {severity} | {parameter_text}",
+                corrupted,
             )
+        )
 
-            output_path = build_output_path(image_path, input_path, output_dir, output_name)
-            cv2.imwrite(str(output_path), corrupted)
-            print(f"Saved: {output_path}")
-            count += 1
+        print(
+            f"Saved severity {severity}: {output_path} "
+            f"(scale={scale:.4f}, reduced={parameter_text})"
+        )
 
-    print(f"\nDone. Generated {count} images.")
+    contact_sheet = create_contact_sheet(contact_images)
+
+    sheet_path = os.path.join(
+        args.output_dir,
+        f"{base_name}_resolution_contact_sheet.png",
+    )
+
+    if not cv2.imwrite(sheet_path, contact_sheet):
+        raise IOError(f"Failed to save: {sheet_path}")
+
+    print(f"\nContact sheet: {sheet_path}")
 
 
 if __name__ == "__main__":

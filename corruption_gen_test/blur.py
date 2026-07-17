@@ -1,172 +1,303 @@
 import argparse
-from pathlib import Path
+import math
+import os
 
 import cv2
 import numpy as np
 
-
-IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
-
-
-def nearest_odd(value):
-    n = max(1, int(round(value)))
-    if n % 2 == 0:
-        n += 1
-    return n
+import normalized_severity as ns
 
 
-def clamp(value, low, high):
-    return max(low, min(high, value))
+SEVERITIES = getattr(ns, "SEVERITIES", list(range(0, 101, 10)))
 
 
-def parse_severities(severity_text, severity_step):
-    if severity_text:
-        severities = [float(x.strip()) for x in severity_text.split(",") if x.strip()]
-    else:
-        severities = list(range(0, 101, severity_step))
-        if severities[-1] != 100:
-            severities.append(100)
+def read_image(path):
+    image = cv2.imread(path, cv2.IMREAD_COLOR)
 
-    for s in severities:
-        if s < 0 or s > 100:
-            raise ValueError(f"Severity must be in [0, 100], got {s}")
-    return severities
-
-
-def severity_string(severity):
-    if float(severity).is_integer():
-        return str(int(severity))
-    return str(severity).replace(".", "p")
-
-
-def collect_images(input_path):
-    input_path = Path(input_path)
-
-    if input_path.is_file():
-        if input_path.suffix.lower() not in IMAGE_EXTENSIONS:
-            raise ValueError(f"Unsupported image file: {input_path}")
-        return [input_path]
-
-    if input_path.is_dir():
-        return sorted(
-            p for p in input_path.rglob("*")
-            if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
+    if image is None:
+        raise FileNotFoundError(
+            f"Could not read image: {path}\n"
+            "Check the path, filename, and extension."
         )
 
-    raise FileNotFoundError(f"Input path does not exist: {input_path}")
+    return image
 
 
-def build_output_path(image_path, input_path, output_dir, output_name):
-    input_path = Path(input_path)
-    output_dir = Path(output_dir)
-
-    if input_path.is_dir():
-        relative_parent = image_path.parent.relative_to(input_path)
-        final_dir = output_dir / relative_parent
-    else:
-        final_dir = output_dir
-
-    final_dir.mkdir(parents=True, exist_ok=True)
-    return final_dir / output_name
+def ensure_directory(path):
+    os.makedirs(path, exist_ok=True)
 
 
-def motion_kernel_size(severity, height, width, max_blur_fraction=0.30, gamma=2.0):
+def force_odd(value):
+    value = max(1, int(round(value)))
+
+    if value % 2 == 0:
+        value += 1
+
+    return value
+
+
+def make_motion_blur_kernel(length, angle_degrees):
     """
-    S in [0,100]
-    m = min(H,W)
-    Lmax = nearest_odd(max_blur_fraction * m)
-    k(S) = nearest_odd(1 + (Lmax - 1) * (S/100)^gamma)
+    Create a normalized linear motion-blur kernel.
     """
-    severity = clamp(severity, 0, 100)
-    m = min(height, width)
-    l_max = nearest_odd(max_blur_fraction * m)
-    return nearest_odd(1 + (l_max - 1) * ((severity / 100.0) ** gamma))
 
+    length = force_odd(length)
 
-def create_motion_blur_kernel(kernel_size, angle_degrees):
-    if kernel_size <= 1:
+    if length <= 1:
         return np.array([[1.0]], dtype=np.float32)
 
-    kernel = np.zeros((kernel_size, kernel_size), dtype=np.float32)
-    center = kernel_size // 2
-    kernel[center, :] = 1.0
+    kernel = np.zeros((length, length), dtype=np.float32)
+    kernel[length // 2, :] = 1.0
 
-    rotation_matrix = cv2.getRotationMatrix2D((center, center), angle_degrees, 1.0)
+    center = (
+        (length - 1) / 2.0,
+        (length - 1) / 2.0,
+    )
 
-    rotated_kernel = cv2.warpAffine(
+    rotation_matrix = cv2.getRotationMatrix2D(
+        center,
+        angle_degrees,
+        1.0,
+    )
+
+    kernel = cv2.warpAffine(
         kernel,
         rotation_matrix,
-        (kernel_size, kernel_size)
+        (length, length),
+        flags=cv2.INTER_LINEAR,
     )
 
-    kernel_sum = rotated_kernel.sum()
-    if kernel_sum != 0:
-        rotated_kernel /= kernel_sum
+    kernel_sum = float(kernel.sum())
 
-    return rotated_kernel
+    if kernel_sum <= 0:
+        return np.array([[1.0]], dtype=np.float32)
+
+    return kernel / kernel_sum
 
 
-def apply_motion_blur(image, severity, angle_degrees=0.0, max_blur_fraction=0.30, gamma=2.0):
+def apply_motion_blur(image, severity, angle_degrees=15.0):
+    """
+    Apply normalized motion blur.
+
+    Severity 0:
+        Original image.
+
+    Severity 100:
+        Complete information collapse to the image's mean color.
+    """
+
+    severity = float(np.clip(severity, 0, 100))
+
+    if severity <= 0:
+        return image.copy(), 1
+
+    if severity >= 100:
+        mean_color = np.mean(
+            image.astype(np.float32),
+            axis=(0, 1),
+            keepdims=True,
+        )
+
+        collapsed = np.broadcast_to(
+            mean_color,
+            image.shape,
+        ).copy()
+
+        return np.clip(collapsed, 0, 255).astype(np.uint8), 0
+
+    blur_length = ns.get_blur_length(severity)
+
+    if blur_length is None:
+        raise ValueError(
+            "get_blur_length() returned None below severity 100."
+        )
+
+    blur_length = force_odd(blur_length)
+
+    # Avoid kernels larger than the image's smallest dimension.
+    maximum_length = max(1, min(image.shape[:2]))
+
+    if maximum_length % 2 == 0:
+        maximum_length -= 1
+
+    maximum_length = max(1, maximum_length)
+    blur_length = min(blur_length, maximum_length)
+
+    kernel = make_motion_blur_kernel(
+        blur_length,
+        angle_degrees,
+    )
+
+    corrupted = cv2.filter2D(
+        image,
+        ddepth=-1,
+        kernel=kernel,
+        borderType=cv2.BORDER_REFLECT101,
+    )
+
+    return corrupted, blur_length
+
+
+def resize_for_cell(image, available_width, available_height):
     height, width = image.shape[:2]
-    kernel_size = motion_kernel_size(
-        severity,
-        height,
-        width,
-        max_blur_fraction=max_blur_fraction,
-        gamma=gamma
+
+    scale = min(
+        available_width / width,
+        available_height / height,
     )
-    kernel = create_motion_blur_kernel(kernel_size, angle_degrees)
-    blurred = cv2.filter2D(image, ddepth=-1, kernel=kernel)
-    return blurred, kernel_size
+
+    new_width = max(1, round(width * scale))
+    new_height = max(1, round(height * scale))
+
+    interpolation = (
+        cv2.INTER_AREA if scale < 1.0
+        else cv2.INTER_NEAREST
+    )
+
+    return cv2.resize(
+        image,
+        (new_width, new_height),
+        interpolation=interpolation,
+    )
+
+
+def create_contact_sheet(
+    labeled_images,
+    columns=3,
+    cell_width=260,
+    cell_height=250,
+):
+    rows = math.ceil(len(labeled_images) / columns)
+
+    sheet = np.full(
+        (rows * cell_height, columns * cell_width, 3),
+        255,
+        dtype=np.uint8,
+    )
+
+    for index, (label, image) in enumerate(labeled_images):
+        row = index // columns
+        column = index % columns
+
+        x_start = column * cell_width
+        y_start = row * cell_height
+
+        preview = resize_for_cell(
+            image,
+            available_width=cell_width - 20,
+            available_height=cell_height - 50,
+        )
+
+        preview_height, preview_width = preview.shape[:2]
+
+        x_offset = x_start + (cell_width - preview_width) // 2
+        y_offset = y_start + 38 + (
+            cell_height - 38 - preview_height
+        ) // 2
+
+        sheet[
+            y_offset:y_offset + preview_height,
+            x_offset:x_offset + preview_width,
+        ] = preview
+
+        cv2.putText(
+            sheet,
+            label,
+            (x_start + 10, y_start + 27),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.58,
+            (0, 0, 0),
+            1,
+            cv2.LINE_AA,
+        )
+
+    return sheet
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate motion blur corruptions.")
-    parser.add_argument("--input", required=True, help="Input image or folder.")
-    parser.add_argument("--output", required=True, help="Output folder.")
-    parser.add_argument("--severity-step", type=int, default=5, help="Default: 5")
-    parser.add_argument("--severities", default=None, help="Optional list like 0,25,50,75,100")
-    parser.add_argument("--angle", type=float, default=0.0, help="Blur angle in degrees.")
-    parser.add_argument("--max-blur-fraction", type=float, default=0.30,
-                        help="Severity 100 blur length as fraction of min(H,W).")
-    parser.add_argument("--gamma", type=float, default=2.0,
-                        help="Severity curve; larger keeps low severities milder.")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Generate normalized motion-blur corruption "
+            "for severity levels 0 through 100."
+        )
+    )
+
+    parser.add_argument(
+        "image",
+        help="Path to the input image.",
+    )
+
+    parser.add_argument(
+        "--output_dir",
+        default="blur_test",
+        help="Output directory. Default: blur_test",
+    )
+
+    parser.add_argument(
+        "--angle",
+        type=float,
+        default=15.0,
+        help="Motion-blur angle in degrees. Default: 15",
+    )
+
     args = parser.parse_args()
 
-    input_path = Path(args.input)
-    output_dir = Path(args.output)
-    severities = parse_severities(args.severities, args.severity_step)
-    image_paths = collect_images(input_path)
+    image = read_image(args.image)
+    ensure_directory(args.output_dir)
 
-    count = 0
+    base_name = os.path.splitext(
+        os.path.basename(args.image)
+    )[0]
 
-    for image_path in image_paths:
-        image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
-        if image is None:
-            print(f"Skipping unreadable image: {image_path}")
-            continue
+    contact_images = []
 
-        for severity in severities:
-            corrupted, kernel_size = apply_motion_blur(
-                image,
-                severity=severity,
-                angle_degrees=args.angle,
-                max_blur_fraction=args.max_blur_fraction,
-                gamma=args.gamma
+    for severity in SEVERITIES:
+        corrupted, blur_length = apply_motion_blur(
+            image,
+            severity,
+            angle_degrees=args.angle,
+        )
+
+        output_name = (
+            f"{base_name}_blur_s{int(severity):03d}.png"
+        )
+
+        output_path = os.path.join(
+            args.output_dir,
+            output_name,
+        )
+
+        if not cv2.imwrite(output_path, corrupted):
+            raise IOError(f"Failed to save: {output_path}")
+
+        parameter_text = (
+            "collapse" if severity >= 100
+            else f"k={blur_length}"
+        )
+
+        contact_images.append(
+            (
+                f"Severity {severity} | {parameter_text}",
+                corrupted,
             )
+        )
 
-            s_text = severity_string(severity)
-            output_name = (
-                f"{image_path.stem}_motion_s{s_text}"
-                f"_k{kernel_size}_a{int(args.angle)}{image_path.suffix}"
-            )
+        print(
+            f"Saved severity {severity}: "
+            f"{output_path} ({parameter_text})"
+        )
 
-            output_path = build_output_path(image_path, input_path, output_dir, output_name)
-            cv2.imwrite(str(output_path), corrupted)
-            print(f"Saved: {output_path}")
-            count += 1
+    contact_sheet = create_contact_sheet(contact_images)
 
-    print(f"\nDone. Generated {count} images.")
+    sheet_path = os.path.join(
+        args.output_dir,
+        f"{base_name}_blur_contact_sheet.png",
+    )
+
+    if not cv2.imwrite(sheet_path, contact_sheet):
+        raise IOError(f"Failed to save: {sheet_path}")
+
+    print(f"\nContact sheet: {sheet_path}")
 
 
 if __name__ == "__main__":
