@@ -1,29 +1,26 @@
 #!/usr/bin/env python3
-"""
-Normalized lighting-variation generator.
+"""Generate normalized lighting-corrupted images for all class folders.
 
-Key behavior
-------------
-1. Preserves the original true-label class folders.
-2. Uses weighted class sampling with a minimum of 100 images per class:
-       n_c = min(N_c, max(minimum_per_class,
-                          round(sampling_fraction * N_c)))
-3. Uses 11 normalized severity levels by default:
-       0, 10, 20, ..., 100
-4. Generates every severity level for every selected source image.
-5. Uses the same seed and sampling algorithm as the other generators.
-6. Uses the established nonlinear spatial lighting target:
-       P(x,y) = 0.5 * (x/(W-1) + y/(H-1))
-       B(x,y) = 1 / (1 + exp(-q(P-0.5)))
-       T(x,y) = M_min + (M_max-M_min)B(x,y)
-       M_s(x,y) = (1-alpha) + alpha*T(x,y)
-7. Writes both a generation metadata CSV and a selected-sources CSV.
+This standalone version preserves the original generator behavior while
+removing the dependency on generation_config.py and crop_corruption_common.py.
+
+Normalized severity:
+    alpha = clamp(severity, 0, 100) / 100
+
+Lighting blend:
+    multiplier = (1 - alpha) + alpha * target
+
+Default severities: 0, 10, ..., 100.
 """
+
+from __future__ import annotations
 
 import argparse
 import csv
 import hashlib
 import random
+import shutil
+from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
@@ -31,112 +28,43 @@ import numpy as np
 
 
 VALID_EXTENSIONS = {
-    ".jpg", ".jpeg", ".png", ".bmp",
-    ".tif", ".tiff", ".webp"
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".bmp",
+    ".tif",
+    ".tiff",
+    ".webp",
 }
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description=(
-            "Generate normalized lighting-variation images using "
-            "weighted class sampling while preserving true-label folders."
-        )
-    )
+@dataclass
+class SelectedImage:
+    crop: str
+    class_name: str
+    source_path: Path
+    relative_path: Path
 
-    parser.add_argument(
-        "--input_root",
-        type=Path,
-        required=True,
-        help="Dataset root containing one folder per true-label class."
-    )
-    parser.add_argument(
-        "--output_root",
-        type=Path,
-        required=True,
-        help="Output root for generated lighting-variation images."
-    )
-    parser.add_argument(
-        "--minimum_per_class",
-        type=int,
-        default=100,
-        help="Minimum number of source images selected per class when available."
-    )
-    parser.add_argument(
-        "--sampling_fraction",
-        type=float,
-        default=0.086,
-        help="Proportional sampling fraction for larger classes."
-    )
-    parser.add_argument(
-        "--severity_levels",
-        type=str,
-        default="0,10,20,30,40,50,60,70,80,90,100",
-        help="Comma-separated severity levels from 0 to 100."
-    )
-    parser.add_argument(
-        "--min_multiplier",
-        type=float,
-        default=0.0,
-        help="Dark-end lighting multiplier at maximum severity."
-    )
-    parser.add_argument(
-        "--max_multiplier",
-        type=float,
-        default=6.0,
-        help="Bright-end lighting multiplier at maximum severity."
-    )
-    parser.add_argument(
-        "--sigmoid_steepness",
-        type=float,
-        default=12.0,
-        help="Steepness q of the spatial sigmoid lighting transition."
-    )
-    parser.add_argument(
-        "--gamma",
-        type=float,
-        default=1.0,
-        help=(
-            "Exponent applied to normalized severity before blending. "
-            "The default 1.0 gives the established linear severity blend."
-        )
-    )
-    parser.add_argument(
-        "--gradient_direction",
-        choices=[
-            "top_left_to_bottom_right",
-            "top_right_to_bottom_left",
-            "bottom_left_to_top_right",
-            "bottom_right_to_top_left"
-        ],
-        default="top_left_to_bottom_right",
-        help="Direction from the darker side toward the brighter side."
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=2026,
-        help="Random seed for reproducible weighted class sampling."
-    )
-    parser.add_argument(
-        "--metadata_csv",
-        type=str,
-        default="lighting_metadata.csv",
-        help="Generation metadata CSV filename."
-    )
-    parser.add_argument(
-        "--selection_csv",
-        type=str,
-        default="lighting_selected_sources.csv",
-        help="CSV recording selected original images."
-    )
-    parser.add_argument(
-        "--overwrite",
-        action="store_true",
-        help="Overwrite an output image when it already exists."
-    )
 
-    return parser.parse_args()
+def clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def normalized_severity(severity: float) -> float:
+    """Convert severity from [0, 100] to [0.0, 1.0]."""
+    return clamp(severity, 0.0, 100.0) / 100.0
+
+
+def severity_string(value: float) -> str:
+    return f"{int(round(value)):03d}"
+
+
+def float_tag(value: float, decimals: int = 2) -> str:
+    return (
+        f"{value:.{decimals}f}"
+        .replace("-", "m")
+        .replace(".", "p")
+    )
 
 
 def stable_integer(text: str) -> int:
@@ -144,260 +72,117 @@ def stable_integer(text: str) -> int:
     return int(digest[:16], 16)
 
 
-def parse_severity_levels(text: str):
-    levels = sorted({
-        int(value.strip())
-        for value in text.split(",")
-        if value.strip()
-    })
+def infer_crop(class_name: str) -> str:
+    if "___" in class_name:
+        return class_name.split("___", 1)[0]
 
-    if not levels:
-        raise ValueError("At least one severity level must be provided.")
+    if "__" in class_name:
+        return class_name.split("__", 1)[0]
 
-    for severity in levels:
+    return class_name
+
+
+def parse_severities(text: str) -> list[int]:
+    severities = sorted(
+        {
+            int(part.strip())
+            for part in text.split(",")
+            if part.strip()
+        }
+    )
+
+    if not severities:
+        raise ValueError("At least one severity must be provided.")
+
+    for severity in severities:
         if not 0 <= severity <= 100:
             raise ValueError(
                 f"Severity {severity} is outside the valid range 0-100."
             )
 
-    return levels
-
-
-def normalized_severity(severity: int) -> float:
-    return float(np.clip(severity, 0, 100)) / 100.0
+    return severities
 
 
 def calculate_sample_count(
     class_size: int,
     minimum_per_class: int,
-    sampling_fraction: float
+    sampling_fraction: float,
 ) -> int:
+    """
+    Weighted class sampling rule:
+
+        selected_count = min(
+            class_size,
+            max(
+                minimum_per_class,
+                round(class_size * sampling_fraction)
+            )
+        )
+    """
     if class_size <= 0:
         return 0
 
-    proportional_count = round(class_size * sampling_fraction)
-    requested_count = max(minimum_per_class, proportional_count)
-    return min(class_size, requested_count)
+    return min(
+        class_size,
+        max(
+            minimum_per_class,
+            round(class_size * sampling_fraction),
+        ),
+    )
 
 
-def find_class_directories(input_root: Path):
+def find_class_directories(input_root: Path) -> list[Path]:
     return sorted(
-        path for path in input_root.iterdir()
+        path
+        for path in input_root.iterdir()
         if path.is_dir()
     )
 
 
-def find_images(class_directory: Path):
+def find_images(class_directory: Path) -> list[Path]:
     return sorted(
-        path for path in class_directory.iterdir()
-        if path.is_file() and path.suffix.lower() in VALID_EXTENSIONS
+        path
+        for path in class_directory.iterdir()
+        if path.is_file()
+        and path.suffix.lower() in VALID_EXTENSIONS
     )
 
 
-def select_weighted_images(
-    images,
+def select_images_for_class(
+    images: list[Path],
     class_name: str,
     minimum_per_class: int,
     sampling_fraction: float,
-    seed: int
-):
+    seed: int,
+) -> list[Path]:
     sample_count = calculate_sample_count(
         class_size=len(images),
         minimum_per_class=minimum_per_class,
-        sampling_fraction=sampling_fraction
+        sampling_fraction=sampling_fraction,
     )
 
     if sample_count >= len(images):
         return list(images)
 
-    rng = random.Random(seed + stable_integer(class_name))
-    return sorted(rng.sample(list(images), sample_count))
-
-
-def create_spatial_progression(
-    height: int,
-    width: int,
-    direction: str
-) -> np.ndarray:
-    """
-    Build P(x,y), ranging approximately from 0 to 1 across the image.
-
-        P(x,y) = 0.5 * (x/(W-1) + y/(H-1))
-    """
-    x = np.linspace(0.0, 1.0, width, dtype=np.float32)
-    y = np.linspace(0.0, 1.0, height, dtype=np.float32)
-
-    xx, yy = np.meshgrid(x, y)
-
-    if direction == "top_left_to_bottom_right":
-        x_component = xx
-        y_component = yy
-    elif direction == "top_right_to_bottom_left":
-        x_component = 1.0 - xx
-        y_component = yy
-    elif direction == "bottom_left_to_top_right":
-        x_component = xx
-        y_component = 1.0 - yy
-    elif direction == "bottom_right_to_top_left":
-        x_component = 1.0 - xx
-        y_component = 1.0 - yy
-    else:
-        raise ValueError(f"Unsupported gradient direction: {direction}")
-
-    return 0.5 * (x_component + y_component)
-
-
-def create_target_lighting_map(
-    height: int,
-    width: int,
-    min_multiplier: float,
-    max_multiplier: float,
-    sigmoid_steepness: float,
-    gradient_direction: str
-) -> np.ndarray:
-    """
-    Established target lighting field:
-
-        P(x,y) = 0.5 * (x/(W-1) + y/(H-1))
-        B(x,y) = 1 / (1 + exp(-q(P-0.5)))
-        T(x,y) = M_min + (M_max-M_min)B(x,y)
-    """
-    if min_multiplier < 0:
-        raise ValueError("min_multiplier cannot be negative.")
-
-    if max_multiplier <= min_multiplier:
-        raise ValueError(
-            "max_multiplier must be greater than min_multiplier."
-        )
-
-    if sigmoid_steepness <= 0:
-        raise ValueError("sigmoid_steepness must be greater than zero.")
-
-    progression = create_spatial_progression(
-        height=height,
-        width=width,
-        direction=gradient_direction
+    rng = random.Random(
+        seed + stable_integer(class_name)
     )
 
-    sigmoid_field = 1.0 / (
-        1.0
-        + np.exp(
-            -sigmoid_steepness * (progression - 0.5)
-        )
-    )
-
-    return (
-        min_multiplier
-        + (max_multiplier - min_multiplier) * sigmoid_field
-    ).astype(np.float32)
-
-
-def apply_lighting_variation(
-    image: np.ndarray,
-    norm_severity: float,
-    target_lighting_map: np.ndarray,
-    gamma: float
-):
-    """
-    Blend the identity multiplier with the target lighting field:
-
-        alpha = normalized_severity^gamma
-        M_s(x,y) = (1-alpha) + alpha*T(x,y)
-        I_s(x,y) = clip(I(x,y)*M_s(x,y), 0, 255)
-    """
-    norm_severity = float(np.clip(norm_severity, 0.0, 1.0))
-
-    if gamma <= 0:
-        raise ValueError("gamma must be greater than zero.")
-
-    alpha = norm_severity ** gamma
-
-    if alpha == 0.0:
-        identity_map = np.ones_like(
-            target_lighting_map,
-            dtype=np.float32
-        )
-        return image.copy(), identity_map, alpha
-
-    severity_map = (
-        (1.0 - alpha)
-        + alpha * target_lighting_map
-    ).astype(np.float32)
-
-    image_float = image.astype(np.float32)
-    corrupted = image_float * severity_map[:, :, None]
-    corrupted = np.clip(corrupted, 0.0, 255.0).astype(np.uint8)
-
-    return corrupted, severity_map, alpha
-
-
-def read_image(path: Path):
-    try:
-        encoded_data = np.fromfile(str(path), dtype=np.uint8)
-        return cv2.imdecode(encoded_data, cv2.IMREAD_COLOR)
-    except (OSError, ValueError):
-        return None
-
-
-def write_image(path: Path, image: np.ndarray) -> bool:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    extension = path.suffix.lower()
-
-    encoding_options = {
-        ".jpg": (".jpg", [int(cv2.IMWRITE_JPEG_QUALITY), 95]),
-        ".jpeg": (".jpg", [int(cv2.IMWRITE_JPEG_QUALITY), 95]),
-        ".png": (".png", [int(cv2.IMWRITE_PNG_COMPRESSION), 3]),
-        ".bmp": (".bmp", []),
-        ".tif": (".tiff", []),
-        ".tiff": (".tiff", []),
-        ".webp": (".webp", [int(cv2.IMWRITE_WEBP_QUALITY), 95]),
-    }
-
-    encode_extension, parameters = encoding_options.get(
-        extension,
-        (".jpg", [int(cv2.IMWRITE_JPEG_QUALITY), 95])
-    )
-
-    success, encoded_image = cv2.imencode(
-        encode_extension,
-        image,
-        parameters
-    )
-
-    if not success:
-        return False
-
-    try:
-        encoded_image.tofile(str(path))
-        return True
-    except OSError:
-        return False
-
-
-def build_output_filename(
-    source_path: Path,
-    severity: int
-) -> str:
-    return (
-        f"{source_path.stem}"
-        f"_lighting"
-        f"_s{severity:03d}"
-        f"{source_path.suffix}"
+    return sorted(
+        rng.sample(images, sample_count)
     )
 
 
-def write_csv(path: Path, rows, fieldnames):
-    with path.open("w", newline="", encoding="utf-8") as csv_file:
-        writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
-
-
-def main():
-    args = parse_args()
-
-    input_root = args.input_root.expanduser().resolve()
-    output_root = args.output_root.expanduser().resolve()
+def prepare_run(
+    input_root: Path,
+    output_root: Path,
+    severities_text: str,
+    minimum_per_class: int,
+    sampling_fraction: float,
+    seed: int,
+) -> tuple[Path, Path, list[int], list[SelectedImage]]:
+    input_root = input_root.expanduser().resolve()
+    output_root = output_root.expanduser().resolve()
 
     if not input_root.exists():
         raise FileNotFoundError(
@@ -409,256 +194,664 @@ def main():
             f"Input root is not a directory: {input_root}"
         )
 
-    if args.minimum_per_class < 1:
-        raise ValueError("minimum_per_class must be at least 1.")
+    if minimum_per_class < 1:
+        raise ValueError(
+            "minimum_per_class must be at least 1."
+        )
 
-    if not 0.0 < args.sampling_fraction <= 1.0:
+    if not 0.0 < sampling_fraction <= 1.0:
         raise ValueError(
             "sampling_fraction must be greater than 0 and at most 1."
         )
 
-    if args.min_multiplier < 0:
-        raise ValueError("min_multiplier cannot be negative.")
+    output_root.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
-    if args.max_multiplier <= args.min_multiplier:
-        raise ValueError(
-            "max_multiplier must be greater than min_multiplier."
-        )
+    severities = parse_severities(
+        severities_text
+    )
 
-    if args.sigmoid_steepness <= 0:
-        raise ValueError(
-            "sigmoid_steepness must be greater than zero."
-        )
-
-    if args.gamma <= 0:
-        raise ValueError("gamma must be greater than zero.")
-
-    output_root.mkdir(parents=True, exist_ok=True)
-
-    severity_levels = parse_severity_levels(args.severity_levels)
-    class_directories = find_class_directories(input_root)
+    class_directories = find_class_directories(
+        input_root
+    )
 
     if not class_directories:
         raise RuntimeError(
-            f"No class directories were found under {input_root}"
+            f"No class directories found under: {input_root}"
         )
 
-    metadata_rows = []
-    selection_rows = []
-
-    total_available_sources = 0
-    total_selected_sources = 0
-    total_generated_images = 0
-    total_skipped_existing = 0
-    unreadable_images = 0
-    failed_writes = 0
-
-    print("=" * 72)
-    print("Normalized Lighting-Variation Generator")
-    print("=" * 72)
-    print(f"Input root:          {input_root}")
-    print(f"Output root:         {output_root}")
-    print(f"Minimum per class:   {args.minimum_per_class}")
-    print(f"Sampling fraction:   {args.sampling_fraction:.4f}")
-    print(f"Severity levels:     {severity_levels}")
-    print(f"Minimum multiplier:  {args.min_multiplier:.4f}")
-    print(f"Maximum multiplier:  {args.max_multiplier:.4f}")
-    print(f"Sigmoid steepness:   {args.sigmoid_steepness:.4f}")
-    print(f"Gamma:               {args.gamma:.4f}")
-    print(f"Gradient direction:  {args.gradient_direction}")
-    print(f"Random seed:         {args.seed}")
-    print("=" * 72)
+    selected: list[SelectedImage] = []
 
     for class_directory in class_directories:
         class_name = class_directory.name
-        available_images = find_images(class_directory)
+        crop = infer_crop(class_name)
+        images = find_images(class_directory)
 
-        if not available_images:
-            print(f"[SKIP] {class_name}: no supported images")
+        if not images:
+            print(
+                f"WARNING: no supported images in {class_directory}"
+            )
             continue
 
-        selected_images = select_weighted_images(
-            images=available_images,
+        chosen = select_images_for_class(
+            images=images,
             class_name=class_name,
-            minimum_per_class=args.minimum_per_class,
-            sampling_fraction=args.sampling_fraction,
-            seed=args.seed
+            minimum_per_class=minimum_per_class,
+            sampling_fraction=sampling_fraction,
+            seed=seed,
         )
-
-        total_available_sources += len(available_images)
-        total_selected_sources += len(selected_images)
-
-        output_class_directory = output_root / class_name
-        output_class_directory.mkdir(parents=True, exist_ok=True)
 
         print(
             f"[CLASS] {class_name}: "
-            f"{len(selected_images)} selected from "
-            f"{len(available_images)}"
+            f"{len(chosen)} selected from {len(images)}"
         )
 
-        for source_index, source_path in enumerate(
-            selected_images,
-            start=1
-        ):
-            selection_rows.append({
-                "true_label": class_name,
-                "source_image_name": source_path.name,
-                "source_image_path": str(source_path),
-                "class_available_count": len(available_images),
-                "class_selected_count": len(selected_images),
-                "sampling_fraction": args.sampling_fraction,
-                "minimum_per_class": args.minimum_per_class,
-                "selection_seed": args.seed
-            })
-
-            image = read_image(source_path)
-
-            if image is None:
-                unreadable_images += 1
-                print(f"  [READ ERROR] {source_path}")
-                continue
-
-            height, width = image.shape[:2]
-
-            target_lighting_map = create_target_lighting_map(
-                height=height,
-                width=width,
-                min_multiplier=args.min_multiplier,
-                max_multiplier=args.max_multiplier,
-                sigmoid_steepness=args.sigmoid_steepness,
-                gradient_direction=args.gradient_direction
+        for image_path in chosen:
+            selected.append(
+                SelectedImage(
+                    crop=crop,
+                    class_name=class_name,
+                    source_path=image_path,
+                    relative_path=(
+                        image_path.relative_to(input_root)
+                    ),
+                )
             )
 
-            target_map_min = float(target_lighting_map.min())
-            target_map_max = float(target_lighting_map.max())
+    if not selected:
+        raise RuntimeError(
+            "No images were selected for generation."
+        )
 
-            for severity in severity_levels:
-                norm_severity = normalized_severity(severity)
+    return (
+        input_root,
+        output_root,
+        severities,
+        selected,
+    )
 
-                output_filename = build_output_filename(
-                    source_path=source_path,
-                    severity=severity
-                )
 
-                output_path = output_class_directory / output_filename
+def build_output_path(
+    output_root: Path,
+    relative_path: Path,
+    output_name: str,
+) -> Path:
+    output_directory = (
+        output_root / relative_path.parent
+    )
 
-                if output_path.exists() and not args.overwrite:
-                    total_skipped_existing += 1
-                    continue
+    output_directory.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
-                corrupted_image, severity_map, alpha = (
-                    apply_lighting_variation(
-                        image=image,
-                        norm_severity=norm_severity,
-                        target_lighting_map=target_lighting_map,
-                        gamma=args.gamma
-                    )
-                )
+    return output_directory / output_name
 
-                if not write_image(output_path, corrupted_image):
-                    failed_writes += 1
-                    print(f"  [WRITE ERROR] {output_path}")
-                    continue
 
-                metadata_rows.append({
-                    "true_label": class_name,
-                    "source_image_name": source_path.name,
-                    "source_image_path": str(source_path),
-                    "generated_image_name": output_filename,
-                    "generated_image_path": str(output_path),
-                    "corruption_type": "lighting",
-                    "severity": severity,
-                    "normalized_severity": f"{norm_severity:.4f}",
-                    "severity_alpha": f"{alpha:.6f}",
-                    "applied_multiplier_min": (
-                        f"{float(severity_map.min()):.6f}"
-                    ),
-                    "applied_multiplier_max": (
-                        f"{float(severity_map.max()):.6f}"
-                    ),
-                    "target_multiplier_min": f"{target_map_min:.6f}",
-                    "target_multiplier_max": f"{target_map_max:.6f}",
-                    "configured_min_multiplier": args.min_multiplier,
-                    "configured_max_multiplier": args.max_multiplier,
-                    "sigmoid_steepness": args.sigmoid_steepness,
-                    "gamma": args.gamma,
-                    "gradient_direction": args.gradient_direction,
-                    "class_available_count": len(available_images),
-                    "class_selected_count": len(selected_images),
-                    "sampling_fraction": args.sampling_fraction,
-                    "minimum_per_class": args.minimum_per_class,
-                    "selection_seed": args.seed
-                })
+def spatial_pattern(
+    height: int,
+    width: int,
+    pattern: str,
+) -> np.ndarray:
+    x = np.linspace(
+        0,
+        1,
+        width,
+        dtype=np.float32,
+    )
 
-                total_generated_images += 1
+    y = np.linspace(
+        0,
+        1,
+        height,
+        dtype=np.float32,
+    )
 
-            if source_index % 25 == 0:
+    xx, yy = np.meshgrid(x, y)
+
+    if pattern == "diagonal":
+        values = 0.5 * (xx + yy)
+
+    elif pattern == "horizontal":
+        values = xx
+
+    elif pattern == "vertical":
+        values = yy
+
+    elif pattern in {"radial", "vignette"}:
+        distance = np.sqrt(
+            (xx - 0.5) ** 2
+            + (yy - 0.5) ** 2
+        )
+
+        maximum = np.sqrt(
+            0.5**2 + 0.5**2
+        )
+
+        values = (
+            1.0
+            - distance / maximum
+        )
+
+        if pattern == "vignette":
+            values = 1.0 - values
+
+    else:
+        raise ValueError(
+            "pattern must be diagonal, horizontal, vertical, "
+            "radial, or vignette."
+        )
+
+    return np.clip(
+        values,
+        0,
+        1,
+    ).astype(np.float32)
+
+
+def apply_lighting(
+    image: np.ndarray,
+    severity: float,
+    minimum_multiplier: float,
+    maximum_multiplier: float,
+    sharpness: float,
+    pattern_name: str,
+) -> np.ndarray:
+    """
+    Apply lighting corruption using normalized severity.
+
+        alpha = clamp(severity, 0, 100) / 100
+
+        split = 1 / (1 + exp(-sharpness * (pattern - 0.5)))
+
+        target = minimum_multiplier
+                 + (maximum_multiplier - minimum_multiplier) * split
+
+        multiplier = (1 - alpha) + alpha * target
+    """
+    if maximum_multiplier < minimum_multiplier:
+        raise ValueError(
+            "maximum_multiplier must be >= minimum_multiplier."
+        )
+
+    if sharpness <= 0:
+        raise ValueError(
+            "sharpness must be positive."
+        )
+
+    height, width = image.shape[:2]
+
+    alpha = normalized_severity(
+        severity
+    )
+
+    pattern = spatial_pattern(
+        height,
+        width,
+        pattern_name,
+    )
+
+    split = 1.0 / (
+        1.0
+        + np.exp(
+            -sharpness * (pattern - 0.5)
+        )
+    )
+
+    target = (
+        minimum_multiplier
+        + (
+            maximum_multiplier
+            - minimum_multiplier
+        )
+        * split
+    )
+
+    multiplier = (
+        (1.0 - alpha)
+        + alpha * target
+    )
+
+    if image.ndim == 3:
+        multiplier = multiplier[:, :, None]
+
+    result = (
+        image.astype(np.float32)
+        * multiplier
+    )
+
+    return np.clip(
+        result,
+        0,
+        255,
+    ).astype(np.uint8)
+
+
+def save_cv_image(
+    path: Path,
+    image: np.ndarray,
+    jpeg_quality: int,
+) -> None:
+    extension = path.suffix.lower()
+
+    if extension in {".jpg", ".jpeg"}:
+        success, encoded = cv2.imencode(
+            ".jpg",
+            image,
+            [
+                int(cv2.IMWRITE_JPEG_QUALITY),
+                jpeg_quality,
+            ],
+        )
+
+    elif extension == ".png":
+        success, encoded = cv2.imencode(
+            ".png",
+            image,
+            [
+                int(cv2.IMWRITE_PNG_COMPRESSION),
+                3,
+            ],
+        )
+
+    elif extension == ".bmp":
+        success, encoded = cv2.imencode(
+            ".bmp",
+            image,
+        )
+
+    elif extension in {".tif", ".tiff"}:
+        success, encoded = cv2.imencode(
+            ".tiff",
+            image,
+        )
+
+    elif extension == ".webp":
+        success, encoded = cv2.imencode(
+            ".webp",
+            image,
+            [
+                int(cv2.IMWRITE_WEBP_QUALITY),
+                jpeg_quality,
+            ],
+        )
+
+    else:
+        success, encoded = cv2.imencode(
+            ".jpg",
+            image,
+            [
+                int(cv2.IMWRITE_JPEG_QUALITY),
+                jpeg_quality,
+            ],
+        )
+
+    if not success:
+        raise IOError(
+            f"OpenCV failed to encode: {path}"
+        )
+
+    try:
+        encoded.tofile(str(path))
+    except OSError as error:
+        raise IOError(
+            f"Failed to save: {path}"
+        ) from error
+
+
+def write_or_copy(
+    source_path: Path,
+    output_path: Path,
+    severity: float,
+    corrupted: np.ndarray | None,
+    overwrite: bool,
+    jpeg_quality: int,
+) -> str:
+    output_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    if output_path.exists() and not overwrite:
+        return "skipped"
+
+    if severity == 0:
+        shutil.copy2(
+            source_path,
+            output_path,
+        )
+        return "written"
+
+    if corrupted is None:
+        raise ValueError(
+            "Corrupted image cannot be None above severity 0."
+        )
+
+    save_cv_image(
+        output_path,
+        corrupted,
+        jpeg_quality,
+    )
+
+    return "written"
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Create a sampled 11-level PlantVillage lighting dataset "
+            "while preserving the clean class-folder structure."
+        )
+    )
+
+    parser.add_argument(
+        "--input-root",
+        type=Path,
+        required=True,
+        help="Root directory containing one folder per class.",
+    )
+
+    parser.add_argument(
+        "--output-root",
+        type=Path,
+        required=True,
+        help="Root directory for generated lighting images.",
+    )
+
+    parser.add_argument(
+        "--severities",
+        type=str,
+        default=(
+            "0,10,20,30,40,50,"
+            "60,70,80,90,100"
+        ),
+        help=(
+            "Comma-separated severity levels. "
+            "Default: 0,10,...,100"
+        ),
+    )
+
+    parser.add_argument(
+        "--minimum-per-class",
+        type=int,
+        default=100,
+        help=(
+            "Minimum selected images per class when available. "
+            "Default: 100"
+        ),
+    )
+
+    parser.add_argument(
+        "--sampling-fraction",
+        type=float,
+        default=0.086,
+        help=(
+            "Weighted class sampling fraction. "
+            "Default: 0.086"
+        ),
+    )
+
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=2026,
+        help=(
+            "Random seed for reproducible sampling. "
+            "Default: 2026"
+        ),
+    )
+
+    parser.add_argument(
+        "--minimum-multiplier",
+        type=float,
+        default=0.0,
+        help=(
+            "Minimum target lighting multiplier. "
+            "Default: 0.0"
+        ),
+    )
+
+    parser.add_argument(
+        "--maximum-multiplier",
+        type=float,
+        default=6.0,
+        help=(
+            "Maximum target lighting multiplier. "
+            "Default: 6.0"
+        ),
+    )
+
+    parser.add_argument(
+        "--sharpness",
+        type=float,
+        default=12.0,
+        help=(
+            "Sigmoid sharpness. "
+            "Default: 12.0"
+        ),
+    )
+
+    parser.add_argument(
+        "--pattern",
+        choices=[
+            "diagonal",
+            "horizontal",
+            "vertical",
+            "radial",
+            "vignette",
+        ],
+        default="diagonal",
+        help=(
+            "Spatial lighting pattern. "
+            "Default: diagonal"
+        ),
+    )
+
+    parser.add_argument(
+        "--jpeg-quality",
+        type=int,
+        default=95,
+        help="JPEG quality. Default: 95",
+    )
+
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Overwrite existing generated files.",
+    )
+
+    parser.add_argument(
+        "--progress-every",
+        type=int,
+        default=25,
+        help=(
+            "Print progress every N source images. "
+            "Default: 25"
+        ),
+    )
+
+    args = parser.parse_args()
+
+    if (
+        args.maximum_multiplier
+        < args.minimum_multiplier
+    ):
+        raise ValueError(
+            "maximum_multiplier must be >= minimum_multiplier."
+        )
+
+    if args.sharpness <= 0:
+        raise ValueError(
+            "sharpness must be positive."
+        )
+
+    if not 0 <= args.jpeg_quality <= 100:
+        raise ValueError(
+            "jpeg_quality must be between 0 and 100."
+        )
+
+    (
+        _,
+        output_root,
+        severities,
+        selected,
+    ) = prepare_run(
+        input_root=args.input_root,
+        output_root=args.output_root,
+        severities_text=args.severities,
+        minimum_per_class=args.minimum_per_class,
+        sampling_fraction=args.sampling_fraction,
+        seed=args.seed,
+    )
+
+    index_path = (
+        output_root / "_lighting_index.csv"
+    )
+
+    written = 0
+    skipped = 0
+    unreadable = 0
+
+    min_tag = float_tag(
+        args.minimum_multiplier,
+        2,
+    )
+
+    max_tag = float_tag(
+        args.maximum_multiplier,
+        2,
+    )
+
+    sharp_tag = float_tag(
+        args.sharpness,
+        2,
+    )
+
+    with index_path.open(
+        "w",
+        newline="",
+        encoding="utf-8",
+    ) as handle:
+        writer = csv.writer(handle)
+
+        writer.writerow(
+            [
+                "crop",
+                "class_name",
+                "source_relative_path",
+                "output_relative_path",
+                "severity",
+                "minimum_multiplier",
+                "maximum_multiplier",
+                "sharpness",
+                "pattern",
+            ]
+        )
+
+        for number, row in enumerate(
+            selected,
+            start=1,
+        ):
+            image = cv2.imread(
+                str(row.source_path),
+                cv2.IMREAD_COLOR,
+            )
+
+            if image is None:
                 print(
-                    f"  Processed {source_index}/"
-                    f"{len(selected_images)} source images"
+                    "WARNING: unreadable image skipped: "
+                    f"{row.source_path}"
+                )
+                unreadable += 1
+                continue
+
+            for severity in severities:
+                output_name = (
+                    f"{row.source_path.stem}"
+                    f"_lighting_s"
+                    f"{severity_string(severity)}"
+                    f"_min{min_tag}"
+                    f"_max{max_tag}"
+                    f"_sh{sharp_tag}"
+                    f"_{args.pattern}"
+                    f"{row.source_path.suffix}"
                 )
 
-    metadata_path = output_root / args.metadata_csv
-    selection_path = output_root / args.selection_csv
+                output_path = build_output_path(
+                    output_root,
+                    row.relative_path,
+                    output_name,
+                )
 
-    metadata_fieldnames = [
-        "true_label",
-        "source_image_name",
-        "source_image_path",
-        "generated_image_name",
-        "generated_image_path",
-        "corruption_type",
-        "severity",
-        "normalized_severity",
-        "severity_alpha",
-        "applied_multiplier_min",
-        "applied_multiplier_max",
-        "target_multiplier_min",
-        "target_multiplier_max",
-        "configured_min_multiplier",
-        "configured_max_multiplier",
-        "sigmoid_steepness",
-        "gamma",
-        "gradient_direction",
-        "class_available_count",
-        "class_selected_count",
-        "sampling_fraction",
-        "minimum_per_class",
-        "selection_seed"
-    ]
+                corrupted = (
+                    apply_lighting(
+                        image=image,
+                        severity=severity,
+                        minimum_multiplier=(
+                            args.minimum_multiplier
+                        ),
+                        maximum_multiplier=(
+                            args.maximum_multiplier
+                        ),
+                        sharpness=args.sharpness,
+                        pattern_name=args.pattern,
+                    )
+                    if severity > 0
+                    else None
+                )
 
-    selection_fieldnames = [
-        "true_label",
-        "source_image_name",
-        "source_image_path",
-        "class_available_count",
-        "class_selected_count",
-        "sampling_fraction",
-        "minimum_per_class",
-        "selection_seed"
-    ]
+                status = write_or_copy(
+                    source_path=row.source_path,
+                    output_path=output_path,
+                    severity=severity,
+                    corrupted=corrupted,
+                    overwrite=args.overwrite,
+                    jpeg_quality=args.jpeg_quality,
+                )
 
-    write_csv(metadata_path, metadata_rows, metadata_fieldnames)
-    write_csv(selection_path, selection_rows, selection_fieldnames)
+                written += status == "written"
+                skipped += status == "skipped"
 
-    expected_images = total_selected_sources * len(severity_levels)
+                writer.writerow(
+                    [
+                        row.crop,
+                        row.class_name,
+                        row.relative_path.as_posix(),
+                        output_path
+                        .relative_to(output_root)
+                        .as_posix(),
+                        severity,
+                        args.minimum_multiplier,
+                        args.maximum_multiplier,
+                        args.sharpness,
+                        args.pattern,
+                    ]
+                )
 
-    print()
-    print("=" * 72)
-    print("Generation complete")
-    print("=" * 72)
-    print(f"Available source images: {total_available_sources}")
-    print(f"Selected source images:  {total_selected_sources}")
-    print(f"Severity levels:         {len(severity_levels)}")
-    print(f"Expected outputs:        {expected_images}")
-    print(f"Generated outputs:       {total_generated_images}")
-    print(f"Skipped existing:        {total_skipped_existing}")
-    print(f"Unreadable sources:      {unreadable_images}")
-    print(f"Failed image writes:     {failed_writes}")
-    print(f"Metadata CSV:            {metadata_path}")
-    print(f"Selection CSV:           {selection_path}")
-    print("=" * 72)
+            if (
+                args.progress_every > 0
+                and (
+                    number % args.progress_every == 0
+                    or number == len(selected)
+                )
+            ):
+                print(
+                    f"Processed {number:,}/"
+                    f"{len(selected):,} "
+                    f"source images."
+                )
+
+    print("\nLighting generation complete.")
+    print(f"Files written: {written:,}")
+    print(
+        f"Existing files skipped: {skipped:,}"
+    )
+    print(
+        f"Unreadable source images: {unreadable:,}"
+    )
+    print(f"Index: {index_path}")
 
 
 if __name__ == "__main__":

@@ -1,24 +1,30 @@
 #!/usr/bin/env python3
-"""
-Normalized resolution-degradation generator.
+"""Generate normalized resolution-degraded images for all class folders.
 
-Key behavior
-------------
-1. Preserves the original true-label class folders.
-2. Uses weighted class sampling with a minimum of 100 images per class:
-       n_c = min(N_c, max(minimum_per_class,
-                          round(sampling_fraction * N_c)))
-3. Uses 11 normalized severity levels by default:
-       0, 10, 20, ..., 100
-4. Generates every severity level for every selected source image.
-5. Uses the same seed and sampling algorithm as the other generators.
-6. Writes both a generation metadata CSV and a selected-sources CSV.
+This standalone version preserves the original generator behavior while
+removing the dependency on generation_config.py and crop_corruption_common.py.
+
+Normalized severity:
+    normalized_severity = clamp(severity, 0, 100) / 100
+
+Resolution scale:
+    scale = 1 - (1 - minimum_scale) * normalized_severity
+
+Therefore:
+    severity 0   -> scale 1.0, exact clean copy
+    severity 100 -> scale minimum_scale
+
+Default severities: 0, 10, ..., 100.
 """
+
+from __future__ import annotations
 
 import argparse
 import csv
 import hashlib
 import random
+import shutil
+from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
@@ -26,102 +32,43 @@ import numpy as np
 
 
 VALID_EXTENSIONS = {
-    ".jpg", ".jpeg", ".png", ".bmp",
-    ".tif", ".tiff", ".webp"
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".bmp",
+    ".tif",
+    ".tiff",
+    ".webp",
 }
 
-INTERPOLATION_METHODS = {
-    "nearest": cv2.INTER_NEAREST,
-    "bilinear": cv2.INTER_LINEAR,
-    "bicubic": cv2.INTER_CUBIC,
-    "lanczos": cv2.INTER_LANCZOS4,
-}
+
+@dataclass
+class SelectedImage:
+    crop: str
+    class_name: str
+    source_path: Path
+    relative_path: Path
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description=(
-            "Generate normalized resolution-degradation images using "
-            "weighted class sampling while preserving true-label folders."
-        )
-    )
+def clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
 
-    parser.add_argument(
-        "--input_root",
-        type=Path,
-        required=True,
-        help="Dataset root containing one folder per true-label class."
-    )
-    parser.add_argument(
-        "--output_root",
-        type=Path,
-        required=True,
-        help="Output root for generated resolution-degradation images."
-    )
-    parser.add_argument(
-        "--minimum_per_class",
-        type=int,
-        default=100,
-        help="Minimum number of source images selected per class when available."
-    )
-    parser.add_argument(
-        "--sampling_fraction",
-        type=float,
-        default=0.086,
-        help="Proportional sampling fraction for larger classes."
-    )
-    parser.add_argument(
-        "--severity_levels",
-        type=str,
-        default="0,10,20,30,40,50,60,70,80,90,100",
-        help="Comma-separated severity levels from 0 to 100."
-    )
-    parser.add_argument(
-        "--min_scale",
-        type=float,
-        default=0.03,
-        help="Retained width/height scale at severity 100."
-    )
-    parser.add_argument(
-        "--gamma",
-        type=float,
-        default=1.0,
-        help=(
-            "Exponent applied to normalized severity. The default 1.0 "
-            "keeps the original linear normalized-severity mapping."
-        )
-    )
-    parser.add_argument(
-        "--upsample_method",
-        choices=sorted(INTERPOLATION_METHODS),
-        default="bilinear",
-        help="Interpolation used to resize the low-resolution image back."
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=2026,
-        help="Random seed for reproducible weighted class sampling."
-    )
-    parser.add_argument(
-        "--metadata_csv",
-        type=str,
-        default="resolution_metadata.csv",
-        help="Generation metadata CSV filename."
-    )
-    parser.add_argument(
-        "--selection_csv",
-        type=str,
-        default="resolution_selected_sources.csv",
-        help="CSV recording selected original images."
-    )
-    parser.add_argument(
-        "--overwrite",
-        action="store_true",
-        help="Overwrite an output image when it already exists."
-    )
 
-    return parser.parse_args()
+def normalized_severity(severity: float) -> float:
+    """Convert severity from [0, 100] to [0.0, 1.0]."""
+    return clamp(severity, 0.0, 100.0) / 100.0
+
+
+def severity_string(value: float) -> str:
+    return f"{int(round(value)):03d}"
+
+
+def float_tag(value: float, decimals: int = 4) -> str:
+    return (
+        f"{value:.{decimals}f}"
+        .replace("-", "m")
+        .replace(".", "p")
+    )
 
 
 def stable_integer(text: str) -> int:
@@ -129,203 +76,125 @@ def stable_integer(text: str) -> int:
     return int(digest[:16], 16)
 
 
-def parse_severity_levels(text: str):
-    levels = sorted({
-        int(value.strip())
-        for value in text.split(",")
-        if value.strip()
-    })
+def infer_crop(class_name: str) -> str:
+    """
+    Infer the crop name from PlantVillage-style class folders.
 
-    if not levels:
-        raise ValueError("At least one severity level must be provided.")
+    Examples:
+        Apple___Apple_scab -> Apple
+        Corn__Common_rust  -> Corn
+        Tomato___healthy   -> Tomato
+    """
+    if "___" in class_name:
+        return class_name.split("___", 1)[0]
 
-    for severity in levels:
+    if "__" in class_name:
+        return class_name.split("__", 1)[0]
+
+    return class_name
+
+
+def parse_severities(text: str) -> list[int]:
+    severities = sorted(
+        {
+            int(part.strip())
+            for part in text.split(",")
+            if part.strip()
+        }
+    )
+
+    if not severities:
+        raise ValueError("At least one severity must be provided.")
+
+    for severity in severities:
         if not 0 <= severity <= 100:
             raise ValueError(
                 f"Severity {severity} is outside the valid range 0-100."
             )
 
-    return levels
-
-
-def normalized_severity(severity: int) -> float:
-    return float(np.clip(severity, 0, 100)) / 100.0
+    return severities
 
 
 def calculate_sample_count(
     class_size: int,
     minimum_per_class: int,
-    sampling_fraction: float
+    sampling_fraction: float,
 ) -> int:
+    """
+    Weighted class sampling rule:
+
+        selected_count = min(
+            class_size,
+            max(
+                minimum_per_class,
+                round(class_size * sampling_fraction)
+            )
+        )
+    """
     if class_size <= 0:
         return 0
 
-    proportional_count = round(class_size * sampling_fraction)
-    requested_count = max(minimum_per_class, proportional_count)
-    return min(class_size, requested_count)
+    return min(
+        class_size,
+        max(
+            minimum_per_class,
+            round(class_size * sampling_fraction),
+        ),
+    )
 
 
-def find_class_directories(input_root: Path):
+def find_class_directories(input_root: Path) -> list[Path]:
     return sorted(
-        path for path in input_root.iterdir()
+        path
+        for path in input_root.iterdir()
         if path.is_dir()
     )
 
 
-def find_images(class_directory: Path):
+def find_images(class_directory: Path) -> list[Path]:
     return sorted(
-        path for path in class_directory.iterdir()
-        if path.is_file() and path.suffix.lower() in VALID_EXTENSIONS
+        path
+        for path in class_directory.iterdir()
+        if path.is_file()
+        and path.suffix.lower() in VALID_EXTENSIONS
     )
 
 
-def select_weighted_images(
-    images,
+def select_images_for_class(
+    images: list[Path],
     class_name: str,
     minimum_per_class: int,
     sampling_fraction: float,
-    seed: int
-):
+    seed: int,
+) -> list[Path]:
     sample_count = calculate_sample_count(
         class_size=len(images),
         minimum_per_class=minimum_per_class,
-        sampling_fraction=sampling_fraction
+        sampling_fraction=sampling_fraction,
     )
 
     if sample_count >= len(images):
         return list(images)
 
-    rng = random.Random(seed + stable_integer(class_name))
-    return sorted(rng.sample(list(images), sample_count))
-
-
-def resolution_scale_from_normalized_severity(
-    norm_severity: float,
-    min_scale: float,
-    gamma: float
-) -> float:
-    """
-    Normalized resolution mapping:
-
-        alpha = severity / 100
-        scale(alpha) = 1 - (1 - min_scale) * alpha^gamma
-
-    With the defaults:
-        severity 0   -> scale 1.00
-        severity 100 -> scale 0.03
-    """
-    norm_severity = float(np.clip(norm_severity, 0.0, 1.0))
-
-    if not 0.0 < min_scale <= 1.0:
-        raise ValueError("min_scale must be greater than 0 and at most 1.")
-
-    if gamma <= 0:
-        raise ValueError("gamma must be greater than zero.")
-
-    return 1.0 - (1.0 - min_scale) * (norm_severity ** gamma)
-
-
-def apply_resolution_degradation(
-    image: np.ndarray,
-    scale: float,
-    upsample_interpolation: int
-):
-    if scale >= 1.0:
-        return image.copy(), image.shape[1], image.shape[0]
-
-    original_height, original_width = image.shape[:2]
-
-    reduced_width = max(1, int(round(original_width * scale)))
-    reduced_height = max(1, int(round(original_height * scale)))
-
-    reduced = cv2.resize(
-        image,
-        (reduced_width, reduced_height),
-        interpolation=cv2.INTER_AREA
+    rng = random.Random(
+        seed + stable_integer(class_name)
     )
 
-    restored = cv2.resize(
-        reduced,
-        (original_width, original_height),
-        interpolation=upsample_interpolation
-    )
-
-    return restored, reduced_width, reduced_height
-
-
-def read_image(path: Path):
-    try:
-        encoded_data = np.fromfile(str(path), dtype=np.uint8)
-        return cv2.imdecode(encoded_data, cv2.IMREAD_COLOR)
-    except (OSError, ValueError):
-        return None
-
-
-def write_image(path: Path, image: np.ndarray) -> bool:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    extension = path.suffix.lower()
-
-    encoding_options = {
-        ".jpg": (".jpg", [int(cv2.IMWRITE_JPEG_QUALITY), 95]),
-        ".jpeg": (".jpg", [int(cv2.IMWRITE_JPEG_QUALITY), 95]),
-        ".png": (".png", [int(cv2.IMWRITE_PNG_COMPRESSION), 3]),
-        ".bmp": (".bmp", []),
-        ".tif": (".tiff", []),
-        ".tiff": (".tiff", []),
-        ".webp": (".webp", [int(cv2.IMWRITE_WEBP_QUALITY), 95]),
-    }
-
-    encode_extension, parameters = encoding_options.get(
-        extension,
-        (".jpg", [int(cv2.IMWRITE_JPEG_QUALITY), 95])
-    )
-
-    success, encoded_image = cv2.imencode(
-        encode_extension,
-        image,
-        parameters
-    )
-
-    if not success:
-        return False
-
-    try:
-        encoded_image.tofile(str(path))
-        return True
-    except OSError:
-        return False
-
-
-def scale_for_filename(scale: float) -> str:
-    return f"{scale:.4f}".replace(".", "p")
-
-
-def build_output_filename(
-    source_path: Path,
-    severity: int,
-    scale: float
-) -> str:
-    return (
-        f"{source_path.stem}"
-        f"_resolution"
-        f"_s{severity:03d}"
-        f"_Sc{scale_for_filename(scale)}"
-        f"{source_path.suffix}"
+    return sorted(
+        rng.sample(images, sample_count)
     )
 
 
-def write_csv(path: Path, rows, fieldnames):
-    with path.open("w", newline="", encoding="utf-8") as csv_file:
-        writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
-
-
-def main():
-    args = parse_args()
-
-    input_root = args.input_root.expanduser().resolve()
-    output_root = args.output_root.expanduser().resolve()
+def prepare_run(
+    input_root: Path,
+    output_root: Path,
+    severities_text: str,
+    minimum_per_class: int,
+    sampling_fraction: float,
+    seed: int,
+) -> tuple[Path, Path, list[int], list[SelectedImage]]:
+    input_root = input_root.expanduser().resolve()
+    output_root = output_root.expanduser().resolve()
 
     if not input_root.exists():
         raise FileNotFoundError(
@@ -337,236 +206,582 @@ def main():
             f"Input root is not a directory: {input_root}"
         )
 
-    if args.minimum_per_class < 1:
-        raise ValueError("minimum_per_class must be at least 1.")
+    if minimum_per_class < 1:
+        raise ValueError(
+            "minimum_per_class must be at least 1."
+        )
 
-    if not 0.0 < args.sampling_fraction <= 1.0:
+    if not 0.0 < sampling_fraction <= 1.0:
         raise ValueError(
             "sampling_fraction must be greater than 0 and at most 1."
         )
 
-    if not 0.0 < args.min_scale <= 1.0:
-        raise ValueError("min_scale must be greater than 0 and at most 1.")
+    output_root.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
-    if args.gamma <= 0:
-        raise ValueError("gamma must be greater than zero.")
+    severities = parse_severities(
+        severities_text
+    )
 
-    output_root.mkdir(parents=True, exist_ok=True)
-
-    severity_levels = parse_severity_levels(args.severity_levels)
-    class_directories = find_class_directories(input_root)
+    class_directories = find_class_directories(
+        input_root
+    )
 
     if not class_directories:
         raise RuntimeError(
-            f"No class directories were found under {input_root}"
+            f"No class directories found under: {input_root}"
         )
 
-    upsample_interpolation = INTERPOLATION_METHODS[
-        args.upsample_method
-    ]
-
-    metadata_rows = []
-    selection_rows = []
-
-    total_available_sources = 0
-    total_selected_sources = 0
-    total_generated_images = 0
-    total_skipped_existing = 0
-    unreadable_images = 0
-    failed_writes = 0
-
-    print("=" * 72)
-    print("Normalized Resolution-Degradation Generator")
-    print("=" * 72)
-    print(f"Input root:          {input_root}")
-    print(f"Output root:         {output_root}")
-    print(f"Minimum per class:   {args.minimum_per_class}")
-    print(f"Sampling fraction:   {args.sampling_fraction:.4f}")
-    print(f"Severity levels:     {severity_levels}")
-    print(f"Minimum scale:       {args.min_scale:.4f}")
-    print(f"Gamma:               {args.gamma:.4f}")
-    print(f"Upsample method:     {args.upsample_method}")
-    print(f"Random seed:         {args.seed}")
-    print("=" * 72)
+    selected: list[SelectedImage] = []
 
     for class_directory in class_directories:
         class_name = class_directory.name
-        available_images = find_images(class_directory)
+        crop = infer_crop(class_name)
+        images = find_images(class_directory)
 
-        if not available_images:
-            print(f"[SKIP] {class_name}: no supported images")
+        if not images:
+            print(
+                f"WARNING: no supported images in {class_directory}"
+            )
             continue
 
-        selected_images = select_weighted_images(
-            images=available_images,
+        chosen = select_images_for_class(
+            images=images,
             class_name=class_name,
-            minimum_per_class=args.minimum_per_class,
-            sampling_fraction=args.sampling_fraction,
-            seed=args.seed
+            minimum_per_class=minimum_per_class,
+            sampling_fraction=sampling_fraction,
+            seed=seed,
         )
-
-        total_available_sources += len(available_images)
-        total_selected_sources += len(selected_images)
-
-        output_class_directory = output_root / class_name
-        output_class_directory.mkdir(parents=True, exist_ok=True)
 
         print(
             f"[CLASS] {class_name}: "
-            f"{len(selected_images)} selected from "
-            f"{len(available_images)}"
+            f"{len(chosen)} selected from {len(images)}"
         )
 
-        for source_index, source_path in enumerate(
-            selected_images,
-            start=1
-        ):
-            selection_rows.append({
-                "true_label": class_name,
-                "source_image_name": source_path.name,
-                "source_image_path": str(source_path),
-                "class_available_count": len(available_images),
-                "class_selected_count": len(selected_images),
-                "sampling_fraction": args.sampling_fraction,
-                "minimum_per_class": args.minimum_per_class,
-                "selection_seed": args.seed
-            })
+        for image_path in chosen:
+            selected.append(
+                SelectedImage(
+                    crop=crop,
+                    class_name=class_name,
+                    source_path=image_path,
+                    relative_path=(
+                        image_path.relative_to(input_root)
+                    ),
+                )
+            )
 
-            image = read_image(source_path)
+    if not selected:
+        raise RuntimeError(
+            "No images were selected for generation."
+        )
+
+    return (
+        input_root,
+        output_root,
+        severities,
+        selected,
+    )
+
+
+def build_output_path(
+    output_root: Path,
+    relative_path: Path,
+    output_name: str,
+) -> Path:
+    output_directory = (
+        output_root / relative_path.parent
+    )
+
+    output_directory.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    return output_directory / output_name
+
+
+def scale_factor(
+    severity: float,
+    minimum_scale: float,
+) -> float:
+    """
+    Normalized resolution mapping:
+
+        n = clamp(severity, 0, 100) / 100
+        scale = 1 - (1 - minimum_scale) * n
+    """
+    if not 0.0 < minimum_scale <= 1.0:
+        raise ValueError(
+            "minimum_scale must be in (0, 1]."
+        )
+
+    norm_severity = normalized_severity(
+        severity
+    )
+
+    scale = (
+        1.0
+        - (1.0 - minimum_scale)
+        * norm_severity
+    )
+
+    return clamp(
+        scale,
+        minimum_scale,
+        1.0,
+    )
+
+
+def degrade(
+    image: np.ndarray,
+    severity: float,
+    minimum_scale: float,
+    upsample_method: str,
+):
+    height, width = image.shape[:2]
+
+    scale = scale_factor(
+        severity=severity,
+        minimum_scale=minimum_scale,
+    )
+
+    small_width = max(
+        1,
+        int(round(width * scale)),
+    )
+
+    small_height = max(
+        1,
+        int(round(height * scale)),
+    )
+
+    reduced = cv2.resize(
+        image,
+        (small_width, small_height),
+        interpolation=cv2.INTER_AREA,
+    )
+
+    methods = {
+        "nearest": cv2.INTER_NEAREST,
+        "linear": cv2.INTER_LINEAR,
+        "cubic": cv2.INTER_CUBIC,
+    }
+
+    method_name = upsample_method.lower()
+
+    if method_name not in methods:
+        raise ValueError(
+            "upsample_method must be nearest, linear, or cubic."
+        )
+
+    restored = cv2.resize(
+        reduced,
+        (width, height),
+        interpolation=methods[method_name],
+    )
+
+    return (
+        restored,
+        scale,
+        small_width,
+        small_height,
+    )
+
+
+def save_cv_image(
+    path: Path,
+    image: np.ndarray,
+    jpeg_quality: int,
+) -> None:
+    extension = path.suffix.lower()
+
+    if extension in {".jpg", ".jpeg"}:
+        success, encoded = cv2.imencode(
+            ".jpg",
+            image,
+            [
+                int(cv2.IMWRITE_JPEG_QUALITY),
+                jpeg_quality,
+            ],
+        )
+
+    elif extension == ".png":
+        success, encoded = cv2.imencode(
+            ".png",
+            image,
+            [
+                int(cv2.IMWRITE_PNG_COMPRESSION),
+                3,
+            ],
+        )
+
+    elif extension == ".bmp":
+        success, encoded = cv2.imencode(
+            ".bmp",
+            image,
+        )
+
+    elif extension in {".tif", ".tiff"}:
+        success, encoded = cv2.imencode(
+            ".tiff",
+            image,
+        )
+
+    elif extension == ".webp":
+        success, encoded = cv2.imencode(
+            ".webp",
+            image,
+            [
+                int(cv2.IMWRITE_WEBP_QUALITY),
+                jpeg_quality,
+            ],
+        )
+
+    else:
+        success, encoded = cv2.imencode(
+            ".jpg",
+            image,
+            [
+                int(cv2.IMWRITE_JPEG_QUALITY),
+                jpeg_quality,
+            ],
+        )
+
+    if not success:
+        raise IOError(
+            f"OpenCV failed to encode: {path}"
+        )
+
+    try:
+        encoded.tofile(str(path))
+    except OSError as error:
+        raise IOError(
+            f"Failed to save: {path}"
+        ) from error
+
+
+def write_or_copy(
+    source_path: Path,
+    output_path: Path,
+    severity: float,
+    corrupted: np.ndarray | None,
+    overwrite: bool,
+    jpeg_quality: int,
+) -> str:
+    output_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    if output_path.exists() and not overwrite:
+        return "skipped"
+
+    if severity == 0:
+        shutil.copy2(
+            source_path,
+            output_path,
+        )
+        return "written"
+
+    if corrupted is None:
+        raise ValueError(
+            "Corrupted image cannot be None above severity 0."
+        )
+
+    save_cv_image(
+        output_path,
+        corrupted,
+        jpeg_quality,
+    )
+
+    return "written"
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Create a sampled 11-level PlantVillage resolution dataset "
+            "while preserving the clean class-folder structure."
+        )
+    )
+
+    parser.add_argument(
+        "--input-root",
+        type=Path,
+        required=True,
+        help="Root directory containing one folder per class.",
+    )
+
+    parser.add_argument(
+        "--output-root",
+        type=Path,
+        required=True,
+        help="Root directory for generated resolution images.",
+    )
+
+    parser.add_argument(
+        "--severities",
+        type=str,
+        default=(
+            "0,10,20,30,40,50,"
+            "60,70,80,90,100"
+        ),
+        help=(
+            "Comma-separated severity levels. "
+            "Default: 0,10,...,100"
+        ),
+    )
+
+    parser.add_argument(
+        "--minimum-per-class",
+        type=int,
+        default=100,
+        help=(
+            "Minimum selected images per class when available. "
+            "Default: 100"
+        ),
+    )
+
+    parser.add_argument(
+        "--sampling-fraction",
+        type=float,
+        default=0.086,
+        help=(
+            "Weighted class sampling fraction. "
+            "Default: 0.086"
+        ),
+    )
+
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=2026,
+        help=(
+            "Random seed for reproducible sampling. "
+            "Default: 2026"
+        ),
+    )
+
+    parser.add_argument(
+        "--minimum-scale",
+        type=float,
+        default=0.03,
+        help=(
+            "Retained width and height scale at severity 100. "
+            "Default: 0.03"
+        ),
+    )
+
+    parser.add_argument(
+        "--upsample-method",
+        choices=[
+            "nearest",
+            "linear",
+            "cubic",
+        ],
+        default="linear",
+        help=(
+            "Upsampling interpolation. "
+            "Default: linear"
+        ),
+    )
+
+    parser.add_argument(
+        "--jpeg-quality",
+        type=int,
+        default=95,
+        help="JPEG quality. Default: 95",
+    )
+
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Overwrite existing generated files.",
+    )
+
+    parser.add_argument(
+        "--progress-every",
+        type=int,
+        default=25,
+        help=(
+            "Print progress every N source images. "
+            "Default: 25"
+        ),
+    )
+
+    args = parser.parse_args()
+
+    if not 0.0 < args.minimum_scale <= 1.0:
+        raise ValueError(
+            "minimum_scale must be in (0, 1]."
+        )
+
+    if not 0 <= args.jpeg_quality <= 100:
+        raise ValueError(
+            "jpeg_quality must be between 0 and 100."
+        )
+
+    (
+        _,
+        output_root,
+        severities,
+        selected,
+    ) = prepare_run(
+        input_root=args.input_root,
+        output_root=args.output_root,
+        severities_text=args.severities,
+        minimum_per_class=args.minimum_per_class,
+        sampling_fraction=args.sampling_fraction,
+        seed=args.seed,
+    )
+
+    index_path = (
+        output_root / "_resolution_index.csv"
+    )
+
+    written = 0
+    skipped = 0
+    unreadable = 0
+
+    with index_path.open(
+        "w",
+        newline="",
+        encoding="utf-8",
+    ) as handle:
+        writer = csv.writer(handle)
+
+        writer.writerow(
+            [
+                "crop",
+                "class_name",
+                "source_relative_path",
+                "output_relative_path",
+                "severity",
+                "scale_factor",
+                "downsample_width",
+                "downsample_height",
+                "upsample_method",
+                "minimum_scale",
+            ]
+        )
+
+        for number, row in enumerate(
+            selected,
+            start=1,
+        ):
+            image = cv2.imread(
+                str(row.source_path),
+                cv2.IMREAD_COLOR,
+            )
 
             if image is None:
-                unreadable_images += 1
-                print(f"  [READ ERROR] {source_path}")
+                print(
+                    "WARNING: unreadable image skipped: "
+                    f"{row.source_path}"
+                )
+                unreadable += 1
                 continue
 
-            original_height, original_width = image.shape[:2]
+            for severity in severities:
+                height, width = image.shape[:2]
 
-            for severity in severity_levels:
-                norm_severity = normalized_severity(severity)
-
-                scale = resolution_scale_from_normalized_severity(
-                    norm_severity=norm_severity,
-                    min_scale=args.min_scale,
-                    gamma=args.gamma
-                )
-
-                output_filename = build_output_filename(
-                    source_path=source_path,
+                scale = scale_factor(
                     severity=severity,
-                    scale=scale
+                    minimum_scale=args.minimum_scale,
                 )
 
-                output_path = output_class_directory / output_filename
+                small_width = max(
+                    1,
+                    int(round(width * scale)),
+                )
 
-                if output_path.exists() and not args.overwrite:
-                    total_skipped_existing += 1
-                    continue
+                small_height = max(
+                    1,
+                    int(round(height * scale)),
+                )
 
-                corrupted_image, reduced_width, reduced_height = (
-                    apply_resolution_degradation(
+                output_name = (
+                    f"{row.source_path.stem}"
+                    f"_resolution_s"
+                    f"{severity_string(severity)}"
+                    f"_Sc{float_tag(scale, 4)}"
+                    f"{row.source_path.suffix}"
+                )
+
+                output_path = build_output_path(
+                    output_root,
+                    row.relative_path,
+                    output_name,
+                )
+
+                corrupted = None
+
+                if severity > 0:
+                    (
+                        corrupted,
+                        scale,
+                        small_width,
+                        small_height,
+                    ) = degrade(
                         image=image,
-                        scale=scale,
-                        upsample_interpolation=upsample_interpolation
+                        severity=severity,
+                        minimum_scale=args.minimum_scale,
+                        upsample_method=args.upsample_method,
                     )
+
+                status = write_or_copy(
+                    source_path=row.source_path,
+                    output_path=output_path,
+                    severity=severity,
+                    corrupted=corrupted,
+                    overwrite=args.overwrite,
+                    jpeg_quality=args.jpeg_quality,
                 )
 
-                if not write_image(output_path, corrupted_image):
-                    failed_writes += 1
-                    print(f"  [WRITE ERROR] {output_path}")
-                    continue
+                written += status == "written"
+                skipped += status == "skipped"
 
-                metadata_rows.append({
-                    "true_label": class_name,
-                    "source_image_name": source_path.name,
-                    "source_image_path": str(source_path),
-                    "generated_image_name": output_filename,
-                    "generated_image_path": str(output_path),
-                    "corruption_type": "resolution",
-                    "severity": severity,
-                    "normalized_severity": f"{norm_severity:.4f}",
-                    "scale_factor": f"{scale:.6f}",
-                    "original_width": original_width,
-                    "original_height": original_height,
-                    "reduced_width": reduced_width,
-                    "reduced_height": reduced_height,
-                    "downsample_method": "area",
-                    "upsample_method": args.upsample_method,
-                    "gamma": args.gamma,
-                    "minimum_scale": args.min_scale,
-                    "class_available_count": len(available_images),
-                    "class_selected_count": len(selected_images),
-                    "sampling_fraction": args.sampling_fraction,
-                    "minimum_per_class": args.minimum_per_class,
-                    "selection_seed": args.seed
-                })
+                writer.writerow(
+                    [
+                        row.crop,
+                        row.class_name,
+                        row.relative_path.as_posix(),
+                        output_path
+                        .relative_to(output_root)
+                        .as_posix(),
+                        severity,
+                        f"{scale:.8f}",
+                        small_width,
+                        small_height,
+                        args.upsample_method,
+                        args.minimum_scale,
+                    ]
+                )
 
-                total_generated_images += 1
-
-            if source_index % 25 == 0:
+            if (
+                args.progress_every > 0
+                and (
+                    number % args.progress_every == 0
+                    or number == len(selected)
+                )
+            ):
                 print(
-                    f"  Processed {source_index}/"
-                    f"{len(selected_images)} source images"
+                    f"Processed {number:,}/"
+                    f"{len(selected):,} "
+                    f"source images."
                 )
 
-    metadata_path = output_root / args.metadata_csv
-    selection_path = output_root / args.selection_csv
-
-    metadata_fieldnames = [
-        "true_label",
-        "source_image_name",
-        "source_image_path",
-        "generated_image_name",
-        "generated_image_path",
-        "corruption_type",
-        "severity",
-        "normalized_severity",
-        "scale_factor",
-        "original_width",
-        "original_height",
-        "reduced_width",
-        "reduced_height",
-        "downsample_method",
-        "upsample_method",
-        "gamma",
-        "minimum_scale",
-        "class_available_count",
-        "class_selected_count",
-        "sampling_fraction",
-        "minimum_per_class",
-        "selection_seed"
-    ]
-
-    selection_fieldnames = [
-        "true_label",
-        "source_image_name",
-        "source_image_path",
-        "class_available_count",
-        "class_selected_count",
-        "sampling_fraction",
-        "minimum_per_class",
-        "selection_seed"
-    ]
-
-    write_csv(metadata_path, metadata_rows, metadata_fieldnames)
-    write_csv(selection_path, selection_rows, selection_fieldnames)
-
-    expected_images = total_selected_sources * len(severity_levels)
-
-    print()
-    print("=" * 72)
-    print("Generation complete")
-    print("=" * 72)
-    print(f"Available source images: {total_available_sources}")
-    print(f"Selected source images:  {total_selected_sources}")
-    print(f"Severity levels:         {len(severity_levels)}")
-    print(f"Expected outputs:        {expected_images}")
-    print(f"Generated outputs:       {total_generated_images}")
-    print(f"Skipped existing:        {total_skipped_existing}")
-    print(f"Unreadable sources:      {unreadable_images}")
-    print(f"Failed image writes:     {failed_writes}")
-    print(f"Metadata CSV:            {metadata_path}")
-    print(f"Selection CSV:           {selection_path}")
-    print("=" * 72)
+    print("\nResolution generation complete.")
+    print(f"Files written: {written:,}")
+    print(
+        f"Existing files skipped: {skipped:,}"
+    )
+    print(
+        f"Unreadable source images: {unreadable:,}"
+    )
+    print(f"Index: {index_path}")
 
 
 if __name__ == "__main__":
