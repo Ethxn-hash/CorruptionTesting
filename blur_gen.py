@@ -1,552 +1,685 @@
-from __future__ import annotations
 import argparse
 import csv
 import hashlib
 import random
-from collections import Counter, defaultdict
 from pathlib import Path
 
 import cv2
 import numpy as np
 
-import normalized_severity as ns
 
-
-SEVERITIES = list(range(0, 101, 10))
-MIN_IMAGES_PER_CLASS = 100
-CLASS_FRACTION = 0.086
-RANDOM_SEED = 2026
-IMAGE_EXTENSIONS = {
+VALID_EXTENSIONS = {
     ".jpg", ".jpeg", ".png", ".bmp",
-    ".tif", ".tiff", ".webp",
+    ".tif", ".tiff", ".webp"
 }
 
-MANIFEST_FIELDS = [
-    "selection_index",
-    "class_path",
-    "source_relative_path",
-    "class_total_images",
-    "selected_from_class",
-    "selected_fraction",
-    "random_seed",
-]
-
-
-def is_inside(path: Path, parent: Path) -> bool:
-    try:
-        path.resolve().relative_to(parent.resolve())
-        return True
-    except ValueError:
-        return False
-
-
-def target_count(class_total: int) -> int:
-    """
-    Exact sampling rule:
-        min(N_c, max(100, round(0.086 * N_c)))
-    """
-    return min(
-        class_total,
-        max(
-            MIN_IMAGES_PER_CLASS,
-            int(round(CLASS_FRACTION * class_total)),
-        ),
-    )
-
-
-def discover_by_class(
-    input_root: Path,
-    excluded_root: Path | None = None,
-) -> dict[str, list[Path]]:
-    grouped: dict[str, list[Path]] = defaultdict(list)
-
-    for path in input_root.rglob("*"):
-        if not path.is_file():
-            continue
-
-        if path.suffix.lower() not in IMAGE_EXTENSIONS:
-            continue
-
-        if excluded_root is not None and is_inside(path, excluded_root):
-            continue
-
-        relative = path.relative_to(input_root)
-        class_path = relative.parent.as_posix()
-        grouped[class_path].append(path)
-
-    for class_path in grouped:
-        grouped[class_path].sort(
-            key=lambda p: p.relative_to(input_root).as_posix().lower()
-        )
-
-    return dict(grouped)
-
-
-def create_manifest(
-    input_root: Path,
-    manifest_path: Path,
-    excluded_root: Path | None = None,
-) -> list[dict[str, str]]:
-    grouped = discover_by_class(input_root, excluded_root)
-
-    if not grouped:
-        raise FileNotFoundError(
-            f"No supported images found under: {input_root}"
-        )
-
-    rng = random.Random(RANDOM_SEED)
-    rows: list[dict[str, str]] = []
-    selection_index = 0
-
-    for class_path in sorted(grouped, key=str.lower):
-        images = grouped[class_path]
-        class_total = len(images)
-        selected_count = target_count(class_total)
-
-        if selected_count >= class_total:
-            selected = list(images)
-        else:
-            selected = rng.sample(images, selected_count)
-            selected.sort(
-                key=lambda p: p.relative_to(input_root).as_posix().lower()
-            )
-
-        fraction = selected_count / class_total
-
-        for image_path in selected:
-            rows.append(
-                {
-                    "selection_index": str(selection_index),
-                    "class_path": class_path,
-                    "source_relative_path": (
-                        image_path.relative_to(input_root).as_posix()
-                    ),
-                    "class_total_images": str(class_total),
-                    "selected_from_class": str(selected_count),
-                    "selected_fraction": f"{fraction:.10f}",
-                    "random_seed": str(RANDOM_SEED),
-                }
-            )
-            selection_index += 1
-
-    manifest_path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = manifest_path.with_suffix(
-        manifest_path.suffix + ".tmp"
-    )
-
-    with temp_path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=MANIFEST_FIELDS)
-        writer.writeheader()
-        writer.writerows(rows)
-
-    temp_path.replace(manifest_path)
-
-    print(f"Created shared manifest: {manifest_path}")
-    print(f"Selected images: {len(rows)}")
-    print(f"Classes: {len(grouped)}")
-    print("Rule: min(N_c, max(100, round(0.086 * N_c)))")
-    print(f"Seed: {RANDOM_SEED}")
-
-    return rows
-
-
-def load_manifest(
-    input_root: Path,
-    manifest_path: Path,
-) -> list[dict[str, str]]:
-    with manifest_path.open("r", newline="", encoding="utf-8") as handle:
-        reader = csv.DictReader(handle)
-        fields = reader.fieldnames or []
-
-        missing = [
-            field for field in MANIFEST_FIELDS
-            if field not in fields
-        ]
-
-        if missing:
-            raise ValueError(
-                f"Manifest is missing required columns: {missing}"
-            )
-
-        rows = list(reader)
-
-    if not rows:
-        raise ValueError(f"Manifest is empty: {manifest_path}")
-
-    seen: set[str] = set()
-
-    for row_number, row in enumerate(rows, start=2):
-        relative_text = row["source_relative_path"]
-        relative_path = Path(relative_text)
-
-        if relative_path.is_absolute():
-            raise ValueError(
-                f"Absolute path in manifest row {row_number}: "
-                f"{relative_text}"
-            )
-
-        source_path = (input_root / relative_path).resolve()
-
-        if not is_inside(source_path, input_root):
-            raise ValueError(
-                f"Manifest path escapes input root: {relative_text}"
-            )
-
-        if not source_path.is_file():
-            raise FileNotFoundError(
-                f"Manifest source does not exist: {source_path}"
-            )
-
-        if relative_text in seen:
-            raise ValueError(
-                f"Duplicate manifest entry: {relative_text}"
-            )
-
-        seen.add(relative_text)
-
-    print(f"Loaded shared manifest: {manifest_path}")
-    print(f"Selected images: {len(rows)}")
-    return rows
-
-
-def get_manifest(
-    input_root: Path,
-    output_root: Path,
-    manifest_arg: Path | None,
-    rebuild: bool,
-) -> tuple[Path, list[dict[str, str]]]:
-    if manifest_arg is None:
-        manifest_path = (
-            input_root.parent
-            / "plantvillage_selected_images.csv"
-        )
-    else:
-        manifest_path = manifest_arg.expanduser().resolve()
-
-    if rebuild or not manifest_path.exists():
-        rows = create_manifest(
-            input_root,
-            manifest_path,
-            excluded_root=output_root,
-        )
-    else:
-        rows = load_manifest(input_root, manifest_path)
-
-    return manifest_path, rows
-
-
-def build_output_stems(
-    manifest_rows: list[dict[str, str]],
-) -> dict[str, str]:
-    counts: Counter[tuple[str, str]] = Counter()
-
-    for row in manifest_rows:
-        relative = Path(row["source_relative_path"])
-        counts[
-            (row["class_path"], relative.stem.casefold())
-        ] += 1
-
-    output_stems: dict[str, str] = {}
-
-    for row in manifest_rows:
-        relative_text = row["source_relative_path"]
-        relative = Path(relative_text)
-        key = (row["class_path"], relative.stem.casefold())
-        stem = relative.stem
-
-        if counts[key] > 1:
-            suffix = hashlib.sha1(
-                relative_text.encode("utf-8")
-            ).hexdigest()[:8]
-            stem = f"{stem}__{suffix}"
-
-        output_stems[relative_text] = stem
-
-    return output_stems
-
-
-def read_image(path: Path) -> np.ndarray:
-    image = cv2.imread(str(path), cv2.IMREAD_COLOR)
-
-    if image is None:
-        raise ValueError(f"Could not read image: {path}")
-
-    return image
-
-
-def output_dir(
-    root: Path,
-    severity: int,
-    class_path: str,
-) -> Path:
-    directory = root / f"severity_{severity:03d}"
-
-    if class_path not in {"", "."}:
-        directory = directory / Path(class_path)
-
-    directory.mkdir(parents=True, exist_ok=True)
-    return directory
-
-
-def save_png(path: Path, image: np.ndarray) -> None:
-    success = cv2.imwrite(
-        str(path),
-        image,
-        [cv2.IMWRITE_PNG_COMPRESSION, 3],
-    )
-
-    if not success:
-        raise IOError(f"Failed to save image: {path}")
 
 def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("input_root", type=Path)
-    parser.add_argument("output_root", type=Path)
-    parser.add_argument("--manifest", type=Path, default=None)
-    parser.add_argument("--rebuild_manifest", action="store_true")
-    parser.add_argument("--angle", type=float, default=15.0)
-    parser.add_argument("--overwrite", action="store_true")
-    parser.add_argument("--progress_every", type=int, default=100)
+    parser = argparse.ArgumentParser(
+        description=(
+            "Generate normalized motion-blur corruption images using "
+            "weighted class sampling while preserving true-label folders."
+        )
+    )
+
+    parser.add_argument(
+        "--input_root",
+        type=Path,
+        required=True,
+        help="Dataset root containing one folder per true-label class."
+    )
+
+    parser.add_argument(
+        "--output_root",
+        type=Path,
+        required=True,
+        help="Output root for generated motion-blur images."
+    )
+
+    parser.add_argument(
+        "--minimum_per_class",
+        type=int,
+        default=100,
+        help="Minimum number of source images selected per class when available."
+    )
+
+    parser.add_argument(
+        "--sampling_fraction",
+        type=float,
+        default=0.086,
+        help=(
+            "Fraction of each class selected. The final count is at least "
+            "minimum_per_class when enough images are available."
+        )
+    )
+
+    parser.add_argument(
+        "--severity_levels",
+        type=str,
+        default="0,10,20,30,40,50,60,70,80,90,100",
+        help="Comma-separated normalized severity levels from 0 to 100."
+    )
+
+    parser.add_argument(
+        "--min_kernel",
+        type=int,
+        default=1,
+        help="Motion-blur kernel size at normalized severity 0."
+    )
+
+    parser.add_argument(
+        "--max_kernel",
+        type=int,
+        default=51,
+        help="Motion-blur kernel size at normalized severity 100."
+    )
+
+    parser.add_argument(
+        "--gamma",
+        type=float,
+        default=1.0,
+        help="Exponent controlling the normalized-severity mapping."
+    )
+
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=2026,
+        help="Random seed for reproducible image selection and blur angles."
+    )
+
+    parser.add_argument(
+        "--metadata_csv",
+        type=str,
+        default="motion_blur_metadata.csv",
+        help="Metadata CSV filename."
+    )
+
+    parser.add_argument(
+        "--selection_csv",
+        type=str,
+        default="motion_blur_selected_sources.csv",
+        help="CSV recording which original images were selected."
+    )
+
     return parser.parse_args()
 
 
-def odd(value: float) -> int:
+def stable_integer(text: str) -> int:
+    """Create a stable integer from text for reproducible randomization."""
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    return int(digest[:16], 16)
+
+
+def parse_severity_levels(text: str):
+    levels = sorted({
+        int(value.strip())
+        for value in text.split(",")
+        if value.strip()
+    })
+
+    if not levels:
+        raise ValueError("At least one severity level must be provided.")
+
+    for severity in levels:
+        if not 0 <= severity <= 100:
+            raise ValueError(
+                f"Severity {severity} is outside the valid range 0–100."
+            )
+
+    return levels
+
+
+def normalized_severity(severity: int) -> float:
+    """Convert severity 0–100 into normalized severity 0.0–1.0."""
+    return float(np.clip(severity, 0, 100)) / 100.0
+
+
+def calculate_sample_count(
+    class_size: int,
+    minimum_per_class: int,
+    sampling_fraction: float
+) -> int:
+    """
+    Weighted class sampling rule:
+
+        selected_count =
+            min(class_size,
+                max(minimum_per_class,
+                    round(class_size * sampling_fraction)))
+
+    Classes with fewer than the requested minimum use all available images.
+    """
+
+    if class_size <= 0:
+        return 0
+
+    proportional_count = round(class_size * sampling_fraction)
+    requested_count = max(minimum_per_class, proportional_count)
+
+    return min(class_size, requested_count)
+
+
+def find_class_directories(input_root: Path):
+    return sorted(
+        path
+        for path in input_root.iterdir()
+        if path.is_dir()
+    )
+
+
+def find_images(class_directory: Path):
+    return sorted(
+        path
+        for path in class_directory.iterdir()
+        if path.is_file() and path.suffix.lower() in VALID_EXTENSIONS
+    )
+
+
+def select_weighted_images(
+    images,
+    class_name: str,
+    minimum_per_class: int,
+    sampling_fraction: float,
+    seed: int
+):
+    sample_count = calculate_sample_count(
+        class_size=len(images),
+        minimum_per_class=minimum_per_class,
+        sampling_fraction=sampling_fraction
+    )
+
+    if sample_count >= len(images):
+        return list(images)
+
+    class_seed = seed + stable_integer(class_name)
+    rng = random.Random(class_seed)
+
+    selected = rng.sample(list(images), sample_count)
+    return sorted(selected)
+
+
+def ensure_odd(value: int) -> int:
     value = max(1, int(round(value)))
-    return value if value % 2 == 1 else value + 1
+
+    if value % 2 == 0:
+        value += 1
+
+    return value
 
 
-def make_kernel(length: int, angle: float) -> np.ndarray:
-    length = odd(length)
+def kernel_size_from_normalized_severity(
+    norm_severity: float,
+    min_kernel: int,
+    max_kernel: int,
+    gamma: float
+) -> int:
+    """
+    Convert normalized severity into motion-blur kernel size.
 
-    if length <= 1:
-        return np.array([[1.0]], dtype=np.float32)
+        scaled severity = normalized_severity ** gamma
 
-    kernel = np.zeros((length, length), dtype=np.float32)
-    kernel[length // 2, :] = 1.0
+        kernel =
+            min_kernel
+            + scaled_severity * (max_kernel - min_kernel)
+    """
 
-    center = ((length - 1) / 2.0, (length - 1) / 2.0)
-    matrix = cv2.getRotationMatrix2D(center, angle, 1.0)
+    norm_severity = float(np.clip(norm_severity, 0.0, 1.0))
 
-    kernel = cv2.warpAffine(
+    min_kernel = ensure_odd(min_kernel)
+    max_kernel = ensure_odd(max_kernel)
+
+    if max_kernel < min_kernel:
+        raise ValueError("max_kernel must be greater than or equal to min_kernel.")
+
+    if gamma <= 0:
+        raise ValueError("gamma must be greater than zero.")
+
+    if norm_severity == 0.0:
+        return 1
+
+    scaled_severity = norm_severity ** gamma
+
+    raw_kernel = (
+        min_kernel
+        + scaled_severity * (max_kernel - min_kernel)
+    )
+
+    return ensure_odd(raw_kernel)
+
+
+def deterministic_blur_angle(
+    source_path: Path,
+    input_root: Path,
+    seed: int
+) -> float:
+    """
+    Give each source image one reproducible motion direction.
+
+    The same image keeps the same angle across all severity levels.
+    """
+
+    relative_path = source_path.relative_to(input_root).as_posix()
+    image_seed = seed + stable_integer(relative_path)
+
+    rng = random.Random(image_seed)
+    return rng.uniform(0.0, 180.0)
+
+
+def create_motion_blur_kernel(
+    kernel_size: int,
+    angle_degrees: float
+) -> np.ndarray:
+    kernel_size = ensure_odd(kernel_size)
+
+    kernel = np.zeros(
+        (kernel_size, kernel_size),
+        dtype=np.float32
+    )
+
+    center_index = kernel_size // 2
+    kernel[center_index, :] = 1.0
+
+    center = (
+        (kernel_size - 1) / 2.0,
+        (kernel_size - 1) / 2.0
+    )
+
+    rotation_matrix = cv2.getRotationMatrix2D(
+        center,
+        angle_degrees,
+        1.0
+    )
+
+    rotated_kernel = cv2.warpAffine(
         kernel,
-        matrix,
-        (length, length),
+        rotation_matrix,
+        (kernel_size, kernel_size),
         flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0
     )
 
-    total = float(kernel.sum())
+    kernel_sum = float(rotated_kernel.sum())
 
-    if total <= 0:
-        return np.array([[1.0]], dtype=np.float32)
+    if kernel_sum <= 0:
+        rotated_kernel[center_index, center_index] = 1.0
+        kernel_sum = 1.0
 
-    return kernel / total
+    return rotated_kernel / kernel_sum
 
 
-def blur_parameters(
+def apply_motion_blur(
     image: np.ndarray,
-    severity: int,
-) -> tuple[int, int]:
-    if severity == 0:
-        return 1, 1
+    kernel_size: int,
+    angle_degrees: float
+) -> np.ndarray:
+    if kernel_size <= 1:
+        return image.copy()
 
-    requested = odd(ns.get_blur_length(severity))
+    kernel = create_motion_blur_kernel(
+        kernel_size=kernel_size,
+        angle_degrees=angle_degrees
+    )
 
-    if severity == 100:
-        return requested, 0
-
-    maximum = min(image.shape[:2])
-
-    if maximum % 2 == 0:
-        maximum -= 1
-
-    maximum = max(1, maximum)
-    effective = min(requested, maximum)
-
-    return requested, effective
-
-
-def apply_blur(
-    image: np.ndarray,
-    severity: int,
-    angle: float,
-) -> tuple[np.ndarray, int, int]:
-    requested, effective = blur_parameters(image, severity)
-
-    if severity == 0:
-        return image.copy(), requested, effective
-
-    if severity == 100:
-        mean_color = np.mean(
-            image.astype(np.float32),
-            axis=(0, 1),
-            keepdims=True,
-        )
-        collapsed = np.broadcast_to(
-            mean_color,
-            image.shape,
-        ).copy()
-        return (
-            np.clip(collapsed, 0, 255).astype(np.uint8),
-            requested,
-            effective,
-        )
-
-    kernel = make_kernel(effective, angle)
-    corrupted = cv2.filter2D(
+    return cv2.filter2D(
         image,
-        -1,
-        kernel,
-        borderType=cv2.BORDER_REFLECT101,
+        ddepth=-1,
+        kernel=kernel,
+        borderType=cv2.BORDER_REFLECT
     )
 
-    return corrupted, requested, effective
+
+def read_image(path: Path):
+    """
+    Read images through imdecode so paths containing spaces or
+    non-ASCII characters work correctly.
+    """
+
+    try:
+        encoded_data = np.fromfile(str(path), dtype=np.uint8)
+        return cv2.imdecode(encoded_data, cv2.IMREAD_COLOR)
+    except (OSError, ValueError):
+        return None
+
+
+def write_image(path: Path, image: np.ndarray) -> bool:
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    extension = path.suffix.lower()
+
+    encoding_options = {
+        ".jpg": (
+            ".jpg",
+            [int(cv2.IMWRITE_JPEG_QUALITY), 95]
+        ),
+        ".jpeg": (
+            ".jpg",
+            [int(cv2.IMWRITE_JPEG_QUALITY), 95]
+        ),
+        ".png": (
+            ".png",
+            [int(cv2.IMWRITE_PNG_COMPRESSION), 3]
+        ),
+        ".bmp": (
+            ".bmp",
+            []
+        ),
+        ".tif": (
+            ".tiff",
+            []
+        ),
+        ".tiff": (
+            ".tiff",
+            []
+        ),
+        ".webp": (
+            ".webp",
+            [int(cv2.IMWRITE_WEBP_QUALITY), 95]
+        )
+    }
+
+    encode_extension, parameters = encoding_options.get(
+        extension,
+        (
+            ".jpg",
+            [int(cv2.IMWRITE_JPEG_QUALITY), 95]
+        )
+    )
+
+    success, encoded_image = cv2.imencode(
+        encode_extension,
+        image,
+        parameters
+    )
+
+    if not success:
+        return False
+
+    try:
+        encoded_image.tofile(str(path))
+        return True
+    except OSError:
+        return False
+
+
+def build_output_filename(
+    source_path: Path,
+    severity: int
+) -> str:
+    return (
+        f"{source_path.stem}"
+        f"_motion_blur"
+        f"_s{severity:03d}"
+        f"{source_path.suffix}"
+    )
+
+
+def write_csv(path: Path, rows, fieldnames):
+    with path.open(
+        "w",
+        newline="",
+        encoding="utf-8"
+    ) as csv_file:
+        writer = csv.DictWriter(
+            csv_file,
+            fieldnames=fieldnames
+        )
+
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def main():
     args = parse_args()
+
     input_root = args.input_root.expanduser().resolve()
     output_root = args.output_root.expanduser().resolve()
 
+    if not input_root.exists():
+        raise FileNotFoundError(
+            f"Input root does not exist: {input_root}"
+        )
+
     if not input_root.is_dir():
         raise NotADirectoryError(
-            f"Input root does not exist or is not a directory: {input_root}"
+            f"Input root is not a directory: {input_root}"
+        )
+
+    if args.minimum_per_class < 1:
+        raise ValueError("minimum_per_class must be at least 1.")
+
+    if not 0 < args.sampling_fraction <= 1:
+        raise ValueError(
+            "sampling_fraction must be greater than 0 and no greater than 1."
         )
 
     output_root.mkdir(parents=True, exist_ok=True)
 
-    manifest_path, rows = get_manifest(
-        input_root,
-        output_root,
-        args.manifest,
-        args.rebuild_manifest,
+    severity_levels = parse_severity_levels(
+        args.severity_levels
     )
-    stems = build_output_stems(rows)
 
-    metadata_path = output_root / "blur_metadata.csv"
-    written = skipped = failed = 0
+    class_directories = find_class_directories(input_root)
 
-    with metadata_path.open("w", newline="", encoding="utf-8") as handle:
-        fields = [
-            "selection_index",
-            "source_relative_path",
-            "class_path",
-            "class_total_images",
-            "selected_from_class",
-            "factor",
-            "severity",
-            "requested_kernel_length",
-            "effective_kernel_length",
-            "angle_degrees",
-            "output_relative_path",
-            "status",
-            "error",
-            "shared_manifest",
-        ]
-        writer = csv.DictWriter(handle, fieldnames=fields)
-        writer.writeheader()
+    if not class_directories:
+        raise RuntimeError(
+            f"No class directories were found under {input_root}"
+        )
 
-        for index, row in enumerate(rows, start=1):
-            relative_text = row["source_relative_path"]
-            source_path = input_root / Path(relative_text)
-            class_path = row["class_path"]
+    metadata_rows = []
+    selection_rows = []
 
-            try:
-                image = read_image(source_path)
-            except Exception as error:
-                failed += len(SEVERITIES)
+    total_available_sources = 0
+    total_selected_sources = 0
+    total_generated_images = 0
+    unreadable_images = 0
+    failed_writes = 0
 
-                for severity in SEVERITIES:
-                    writer.writerow({
-                        "selection_index": row["selection_index"],
-                        "source_relative_path": relative_text,
-                        "class_path": class_path,
-                        "class_total_images": row["class_total_images"],
-                        "selected_from_class": row["selected_from_class"],
-                        "factor": "motion_blur",
-                        "severity": severity,
-                        "requested_kernel_length": "",
-                        "effective_kernel_length": "",
-                        "angle_degrees": args.angle,
-                        "output_relative_path": "",
-                        "status": "failed",
-                        "error": str(error),
-                        "shared_manifest": str(manifest_path),
-                    })
+    print("=" * 70)
+    print("Normalized Motion Blur Generator")
+    print("=" * 70)
+    print(f"Input root:          {input_root}")
+    print(f"Output root:         {output_root}")
+    print(f"Minimum per class:   {args.minimum_per_class}")
+    print(f"Sampling fraction:   {args.sampling_fraction:.4f}")
+    print(f"Severity levels:     {severity_levels}")
+    print(f"Random seed:         {args.seed}")
+    print("=" * 70)
+
+    for class_directory in class_directories:
+        class_name = class_directory.name
+        available_images = find_images(class_directory)
+
+        if not available_images:
+            print(f"[SKIP] {class_name}: no supported images")
+            continue
+
+        selected_images = select_weighted_images(
+            images=available_images,
+            class_name=class_name,
+            minimum_per_class=args.minimum_per_class,
+            sampling_fraction=args.sampling_fraction,
+            seed=args.seed
+        )
+
+        total_available_sources += len(available_images)
+        total_selected_sources += len(selected_images)
+
+        output_class_directory = output_root / class_name
+        output_class_directory.mkdir(
+            parents=True,
+            exist_ok=True
+        )
+
+        print(
+            f"[CLASS] {class_name}: "
+            f"{len(selected_images)} selected from "
+            f"{len(available_images)}"
+        )
+
+        for source_index, source_path in enumerate(
+            selected_images,
+            start=1
+        ):
+            selection_rows.append({
+                "true_label": class_name,
+                "source_image_name": source_path.name,
+                "source_image_path": str(source_path),
+                "class_available_count": len(available_images),
+                "class_selected_count": len(selected_images),
+                "sampling_fraction": args.sampling_fraction,
+                "minimum_per_class": args.minimum_per_class,
+                "selection_seed": args.seed
+            })
+
+            image = read_image(source_path)
+
+            if image is None:
+                unreadable_images += 1
+                print(f"  [READ ERROR] {source_path}")
                 continue
 
-            for severity in SEVERITIES:
-                destination = output_dir(
-                    output_root,
-                    severity,
-                    class_path,
-                ) / (
-                    f"{stems[relative_text]}_blur_s{severity:03d}.png"
+            angle_degrees = deterministic_blur_angle(
+                source_path=source_path,
+                input_root=input_root,
+                seed=args.seed
+            )
+
+            for severity in severity_levels:
+                norm_severity = normalized_severity(severity)
+
+                kernel_size = kernel_size_from_normalized_severity(
+                    norm_severity=norm_severity,
+                    min_kernel=args.min_kernel,
+                    max_kernel=args.max_kernel,
+                    gamma=args.gamma
                 )
 
-                status = "written"
-                error_text = ""
-                requested = effective = ""
-
-                try:
-                    requested, effective = blur_parameters(
-                        image,
-                        severity,
+                if norm_severity == 0.0:
+                    corrupted_image = image.copy()
+                else:
+                    corrupted_image = apply_motion_blur(
+                        image=image,
+                        kernel_size=kernel_size,
+                        angle_degrees=angle_degrees
                     )
 
-                    if destination.exists() and not args.overwrite:
-                        status = "skipped_existing"
-                        skipped += 1
-                    else:
-                        corrupted, requested, effective = apply_blur(
-                            image,
-                            severity,
-                            args.angle,
-                        )
-                        save_png(destination, corrupted)
-                        written += 1
+                output_filename = build_output_filename(
+                    source_path=source_path,
+                    severity=severity
+                )
 
-                except Exception as error:
-                    status = "failed"
-                    error_text = str(error)
-                    failed += 1
+                output_path = (
+                    output_class_directory
+                    / output_filename
+                )
 
-                writer.writerow({
-                    "selection_index": row["selection_index"],
-                    "source_relative_path": relative_text,
-                    "class_path": class_path,
-                    "class_total_images": row["class_total_images"],
-                    "selected_from_class": row["selected_from_class"],
-                    "factor": "motion_blur",
+                successfully_written = write_image(
+                    output_path,
+                    corrupted_image
+                )
+
+                if not successfully_written:
+                    failed_writes += 1
+                    print(f"  [WRITE ERROR] {output_path}")
+                    continue
+
+                metadata_rows.append({
+                    "true_label": class_name,
+                    "source_image_name": source_path.name,
+                    "source_image_path": str(source_path),
+                    "generated_image_name": output_filename,
+                    "generated_image_path": str(output_path),
+                    "corruption_type": "motion_blur",
                     "severity": severity,
-                    "requested_kernel_length": requested,
-                    "effective_kernel_length": effective,
-                    "angle_degrees": args.angle,
-                    "output_relative_path": (
-                        destination.relative_to(output_root).as_posix()
-                        if status != "failed"
-                        else ""
-                    ),
-                    "status": status,
-                    "error": error_text,
-                    "shared_manifest": str(manifest_path),
+                    "normalized_severity": f"{norm_severity:.4f}",
+                    "kernel_size": kernel_size,
+                    "angle_degrees": f"{angle_degrees:.4f}",
+                    "gamma": args.gamma,
+                    "min_kernel": args.min_kernel,
+                    "max_kernel": args.max_kernel,
+                    "class_available_count": len(available_images),
+                    "class_selected_count": len(selected_images),
+                    "sampling_fraction": args.sampling_fraction,
+                    "minimum_per_class": args.minimum_per_class,
+                    "selection_seed": args.seed
                 })
 
-            if (
-                args.progress_every > 0
-                and (
-                    index % args.progress_every == 0
-                    or index == len(rows)
-                )
-            ):
+                total_generated_images += 1
+
+            if source_index % 25 == 0:
                 print(
-                    f"[{index}/{len(rows)}] "
-                    f"written={written}, skipped={skipped}, failed={failed}"
+                    f"  Processed {source_index}/"
+                    f"{len(selected_images)} source images"
                 )
 
-    print("Blur generation complete.")
-    print(f"Manifest: {manifest_path}")
-    print(f"Metadata: {metadata_path}")
-    print(f"Written={written}, skipped={skipped}, failed={failed}")
+    metadata_path = output_root / args.metadata_csv
+    selection_path = output_root / args.selection_csv
+
+    metadata_fieldnames = [
+        "true_label",
+        "source_image_name",
+        "source_image_path",
+        "generated_image_name",
+        "generated_image_path",
+        "corruption_type",
+        "severity",
+        "normalized_severity",
+        "kernel_size",
+        "angle_degrees",
+        "gamma",
+        "min_kernel",
+        "max_kernel",
+        "class_available_count",
+        "class_selected_count",
+        "sampling_fraction",
+        "minimum_per_class",
+        "selection_seed"
+    ]
+
+    selection_fieldnames = [
+        "true_label",
+        "source_image_name",
+        "source_image_path",
+        "class_available_count",
+        "class_selected_count",
+        "sampling_fraction",
+        "minimum_per_class",
+        "selection_seed"
+    ]
+
+    write_csv(
+        metadata_path,
+        metadata_rows,
+        metadata_fieldnames
+    )
+
+    write_csv(
+        selection_path,
+        selection_rows,
+        selection_fieldnames
+    )
+
+    expected_images = (
+        total_selected_sources
+        * len(severity_levels)
+    )
+
+    print()
+    print("=" * 70)
+    print("Generation complete")
+    print("=" * 70)
+    print(f"Available source images: {total_available_sources}")
+    print(f"Selected source images:  {total_selected_sources}")
+    print(f"Severity levels:         {len(severity_levels)}")
+    print(f"Expected outputs:        {expected_images}")
+    print(f"Generated outputs:       {total_generated_images}")
+    print(f"Unreadable sources:      {unreadable_images}")
+    print(f"Failed image writes:     {failed_writes}")
+    print(f"Metadata CSV:            {metadata_path}")
+    print(f"Selection CSV:           {selection_path}")
+    print("=" * 70)
 
 
 if __name__ == "__main__":
