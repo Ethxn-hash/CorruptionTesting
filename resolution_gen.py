@@ -1,20 +1,33 @@
 #!/usr/bin/env python3
-"""Generate normalized resolution-degraded images for all class folders.
+"""Generate the sampled PlantVillage resolution-degradation dataset.
 
-This standalone version preserves the original generator behavior while
-removing the dependency on generation_config.py and crop_corruption_common.py.
+This standalone generator matches the normalized severity used in:
+    corruption_gen_test/resolution.py
+    corruption_gen_test/normalized_severity.py
 
-Normalized severity:
-    normalized_severity = clamp(severity, 0, 100) / 100
+Resolution scale table:
+    0: 1.000
+   10: 0.780
+   20: 0.580
+   30: 0.420
+   40: 0.300
+   50: 0.210
+   60: 0.140
+   70: 0.090
+   80: 0.050
+   90: 0.020
+  100: 0.000
 
-Resolution scale:
-    scale = 1 - (1 - minimum_scale) * normalized_severity
+Severity 100 is reduced to exactly 1 x 1 pixel and enlarged back.
 
-Therefore:
-    severity 0   -> scale 1.0, exact clean copy
-    severity 100 -> scale minimum_scale
-
-Default severities: 0, 10, ..., 100.
+All dataset-generation behavior remains standalone:
+- all direct class folders are processed
+- weighted sampling with a minimum of 100 images per class
+- reproducible seed 2026
+- true-label folder hierarchy is preserved
+- severity 0 is copied exactly
+- overwrite and progress controls are supported
+- _resolution_index.csv is written
 """
 
 from __future__ import annotations
@@ -24,6 +37,7 @@ import csv
 import hashlib
 import random
 import shutil
+from bisect import bisect_right
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -32,13 +46,22 @@ import numpy as np
 
 
 VALID_EXTENSIONS = {
-    ".jpg",
-    ".jpeg",
-    ".png",
-    ".bmp",
-    ".tif",
-    ".tiff",
-    ".webp",
+    ".jpg", ".jpeg", ".png", ".bmp",
+    ".tif", ".tiff", ".webp",
+}
+
+RESOLUTION_SCALE_TABLE = {
+    0: 1.000,
+    10: 0.780,
+    20: 0.580,
+    30: 0.420,
+    40: 0.300,
+    50: 0.210,
+    60: 0.140,
+    70: 0.090,
+    80: 0.050,
+    90: 0.020,
+    100: 0.000,
 }
 
 
@@ -52,11 +75,6 @@ class SelectedImage:
 
 def clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
-
-
-def normalized_severity(severity: float) -> float:
-    """Convert severity from [0, 100] to [0.0, 1.0]."""
-    return clamp(severity, 0.0, 100.0) / 100.0
 
 
 def severity_string(value: float) -> str:
@@ -77,31 +95,19 @@ def stable_integer(text: str) -> int:
 
 
 def infer_crop(class_name: str) -> str:
-    """
-    Infer the crop name from PlantVillage-style class folders.
-
-    Examples:
-        Apple___Apple_scab -> Apple
-        Corn__Common_rust  -> Corn
-        Tomato___healthy   -> Tomato
-    """
     if "___" in class_name:
         return class_name.split("___", 1)[0]
-
     if "__" in class_name:
         return class_name.split("__", 1)[0]
-
     return class_name
 
 
 def parse_severities(text: str) -> list[int]:
-    severities = sorted(
-        {
-            int(part.strip())
-            for part in text.split(",")
-            if part.strip()
-        }
-    )
+    severities = sorted({
+        int(part.strip())
+        for part in text.split(",")
+        if part.strip()
+    })
 
     if not severities:
         raise ValueError("At least one severity must be provided.")
@@ -115,22 +121,72 @@ def parse_severities(text: str) -> list[int]:
     return severities
 
 
+def interpolate_table(table: dict[int, float], severity: float) -> float:
+    """Linearly interpolate between the repository's severity entries."""
+    severity = clamp(float(severity), 0.0, 100.0)
+    keys = sorted(table)
+
+    if severity <= keys[0]:
+        return float(table[keys[0]])
+
+    if severity >= keys[-1]:
+        return float(table[keys[-1]])
+
+    exact = int(severity)
+    if float(severity).is_integer() and exact in table:
+        return float(table[exact])
+
+    upper_index = bisect_right(keys, severity)
+    lower_key = keys[upper_index - 1]
+    upper_key = keys[upper_index]
+
+    fraction = (
+        (severity - lower_key)
+        / (upper_key - lower_key)
+    )
+
+    return (
+        float(table[lower_key])
+        + fraction
+        * (
+            float(table[upper_key])
+            - float(table[lower_key])
+        )
+    )
+
+
+def scale_factor(
+    severity: float,
+    minimum_scale: float = 0.0,
+) -> float:
+    """Use the repository lookup table, optionally retaining a custom floor.
+
+    The default minimum_scale=0.0 matches corruption_gen_test exactly.
+    A nonzero floor is retained only for backward-compatible experimentation.
+    """
+    if not 0.0 <= minimum_scale <= 1.0:
+        raise ValueError(
+            "minimum_scale must be between 0 and 1."
+        )
+
+    base_scale = interpolate_table(
+        RESOLUTION_SCALE_TABLE,
+        severity,
+    )
+
+    value = (
+        minimum_scale
+        + (1.0 - minimum_scale) * base_scale
+    )
+
+    return clamp(value, minimum_scale, 1.0)
+
+
 def calculate_sample_count(
     class_size: int,
     minimum_per_class: int,
     sampling_fraction: float,
 ) -> int:
-    """
-    Weighted class sampling rule:
-
-        selected_count = min(
-            class_size,
-            max(
-                minimum_per_class,
-                round(class_size * sampling_fraction)
-            )
-        )
-    """
     if class_size <= 0:
         return 0
 
@@ -179,7 +235,6 @@ def select_images_for_class(
     rng = random.Random(
         seed + stable_integer(class_name)
     )
-
     return sorted(
         rng.sample(images, sample_count)
     )
@@ -216,18 +271,10 @@ def prepare_run(
             "sampling_fraction must be greater than 0 and at most 1."
         )
 
-    output_root.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    output_root.mkdir(parents=True, exist_ok=True)
 
-    severities = parse_severities(
-        severities_text
-    )
-
-    class_directories = find_class_directories(
-        input_root
-    )
+    severities = parse_severities(severities_text)
+    class_directories = find_class_directories(input_root)
 
     if not class_directories:
         raise RuntimeError(
@@ -266,9 +313,7 @@ def prepare_run(
                     crop=crop,
                     class_name=class_name,
                     source_path=image_path,
-                    relative_path=(
-                        image_path.relative_to(input_root)
-                    ),
+                    relative_path=image_path.relative_to(input_root),
                 )
             )
 
@@ -277,12 +322,7 @@ def prepare_run(
             "No images were selected for generation."
         )
 
-    return (
-        input_root,
-        output_root,
-        severities,
-        selected,
-    )
+    return input_root, output_root, severities, selected
 
 
 def build_output_path(
@@ -290,72 +330,36 @@ def build_output_path(
     relative_path: Path,
     output_name: str,
 ) -> Path:
-    output_directory = (
-        output_root / relative_path.parent
-    )
-
-    output_directory.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
+    output_directory = output_root / relative_path.parent
+    output_directory.mkdir(parents=True, exist_ok=True)
     return output_directory / output_name
-
-
-def scale_factor(
-    severity: float,
-    minimum_scale: float,
-) -> float:
-    """
-    Normalized resolution mapping:
-
-        n = clamp(severity, 0, 100) / 100
-        scale = 1 - (1 - minimum_scale) * n
-    """
-    if not 0.0 < minimum_scale <= 1.0:
-        raise ValueError(
-            "minimum_scale must be in (0, 1]."
-        )
-
-    norm_severity = normalized_severity(
-        severity
-    )
-
-    scale = (
-        1.0
-        - (1.0 - minimum_scale)
-        * norm_severity
-    )
-
-    return clamp(
-        scale,
-        minimum_scale,
-        1.0,
-    )
 
 
 def degrade(
     image: np.ndarray,
     severity: float,
-    minimum_scale: float,
     upsample_method: str,
+    minimum_scale: float = 0.0,
 ):
     height, width = image.shape[:2]
-
     scale = scale_factor(
-        severity=severity,
+        severity,
         minimum_scale=minimum_scale,
     )
 
-    small_width = max(
-        1,
-        int(round(width * scale)),
-    )
-
-    small_height = max(
-        1,
-        int(round(height * scale)),
-    )
+    if severity >= 100 and minimum_scale == 0.0:
+        small_width = 1
+        small_height = 1
+        scale = 0.0
+    else:
+        small_width = max(
+            1,
+            int(round(width * scale)),
+        )
+        small_height = max(
+            1,
+            int(round(height * scale)),
+        )
 
     reduced = cv2.resize(
         image,
@@ -369,25 +373,13 @@ def degrade(
         "cubic": cv2.INTER_CUBIC,
     }
 
-    method_name = upsample_method.lower()
-
-    if method_name not in methods:
-        raise ValueError(
-            "upsample_method must be nearest, linear, or cubic."
-        )
-
     restored = cv2.resize(
         reduced,
         (width, height),
-        interpolation=methods[method_name],
+        interpolation=methods[upsample_method],
     )
 
-    return (
-        restored,
-        scale,
-        small_width,
-        small_height,
-    )
+    return restored, scale, small_width, small_height
 
 
 def save_cv_image(
@@ -401,65 +393,35 @@ def save_cv_image(
         success, encoded = cv2.imencode(
             ".jpg",
             image,
-            [
-                int(cv2.IMWRITE_JPEG_QUALITY),
-                jpeg_quality,
-            ],
+            [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_quality],
         )
-
     elif extension == ".png":
         success, encoded = cv2.imencode(
             ".png",
             image,
-            [
-                int(cv2.IMWRITE_PNG_COMPRESSION),
-                3,
-            ],
+            [int(cv2.IMWRITE_PNG_COMPRESSION), 3],
         )
-
     elif extension == ".bmp":
-        success, encoded = cv2.imencode(
-            ".bmp",
-            image,
-        )
-
+        success, encoded = cv2.imencode(".bmp", image)
     elif extension in {".tif", ".tiff"}:
-        success, encoded = cv2.imencode(
-            ".tiff",
-            image,
-        )
-
+        success, encoded = cv2.imencode(".tiff", image)
     elif extension == ".webp":
         success, encoded = cv2.imencode(
             ".webp",
             image,
-            [
-                int(cv2.IMWRITE_WEBP_QUALITY),
-                jpeg_quality,
-            ],
+            [int(cv2.IMWRITE_WEBP_QUALITY), jpeg_quality],
         )
-
     else:
         success, encoded = cv2.imencode(
             ".jpg",
             image,
-            [
-                int(cv2.IMWRITE_JPEG_QUALITY),
-                jpeg_quality,
-            ],
+            [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_quality],
         )
 
     if not success:
-        raise IOError(
-            f"OpenCV failed to encode: {path}"
-        )
+        raise IOError(f"OpenCV failed to encode: {path}")
 
-    try:
-        encoded.tofile(str(path))
-    except OSError as error:
-        raise IOError(
-            f"Failed to save: {path}"
-        ) from error
+    encoded.tofile(str(path))
 
 
 def write_or_copy(
@@ -470,19 +432,13 @@ def write_or_copy(
     overwrite: bool,
     jpeg_quality: int,
 ) -> str:
-    output_path.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
     if output_path.exists() and not overwrite:
         return "skipped"
 
     if severity == 0:
-        shutil.copy2(
-            source_path,
-            output_path,
-        )
+        shutil.copy2(source_path, output_path)
         return "written"
 
     if corrupted is None:
@@ -490,12 +446,7 @@ def write_or_copy(
             "Corrupted image cannot be None above severity 0."
         )
 
-    save_cv_image(
-        output_path,
-        corrupted,
-        jpeg_quality,
-    )
-
+    save_cv_image(output_path, corrupted, jpeg_quality)
     return "written"
 
 
@@ -503,7 +454,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             "Create a sampled 11-level PlantVillage resolution dataset "
-            "while preserving the clean class-folder structure."
+            "using the exact corruption_gen_test normalized severity."
         )
     )
 
@@ -513,109 +464,75 @@ def main() -> None:
         required=True,
         help="Root directory containing one folder per class.",
     )
-
     parser.add_argument(
         "--output-root",
         type=Path,
         required=True,
         help="Root directory for generated resolution images.",
     )
-
     parser.add_argument(
         "--severities",
         type=str,
-        default=(
-            "0,10,20,30,40,50,"
-            "60,70,80,90,100"
-        ),
-        help=(
-            "Comma-separated severity levels. "
-            "Default: 0,10,...,100"
-        ),
+        default="0,10,20,30,40,50,60,70,80,90,100",
+        help="Comma-separated severity levels. Default: 0,10,...,100",
     )
-
     parser.add_argument(
         "--minimum-per-class",
         type=int,
         default=100,
-        help=(
-            "Minimum selected images per class when available. "
-            "Default: 100"
-        ),
+        help="Minimum selected images per class when available.",
     )
-
     parser.add_argument(
         "--sampling-fraction",
         type=float,
         default=0.086,
-        help=(
-            "Weighted class sampling fraction. "
-            "Default: 0.086"
-        ),
+        help="Weighted class sampling fraction.",
     )
-
     parser.add_argument(
         "--seed",
         type=int,
         default=2026,
-        help=(
-            "Random seed for reproducible sampling. "
-            "Default: 2026"
-        ),
+        help="Random seed for reproducible sampling.",
     )
-
     parser.add_argument(
         "--minimum-scale",
         type=float,
-        default=0.03,
+        default=0.0,
         help=(
-            "Retained width and height scale at severity 100. "
-            "Default: 0.03"
+            "Optional retained scale floor. Default: 0.0, which exactly "
+            "matches corruption_gen_test and makes severity 100 a 1x1 "
+            "reconstruction."
         ),
     )
-
     parser.add_argument(
         "--upsample-method",
-        choices=[
-            "nearest",
-            "linear",
-            "cubic",
-        ],
+        choices=["nearest", "linear", "cubic"],
         default="linear",
-        help=(
-            "Upsampling interpolation. "
-            "Default: linear"
-        ),
+        help="Upsampling interpolation. Default: linear",
     )
-
     parser.add_argument(
         "--jpeg-quality",
         type=int,
         default=95,
         help="JPEG quality. Default: 95",
     )
-
     parser.add_argument(
         "--overwrite",
         action="store_true",
         help="Overwrite existing generated files.",
     )
-
     parser.add_argument(
         "--progress-every",
         type=int,
         default=25,
-        help=(
-            "Print progress every N source images. "
-            "Default: 25"
-        ),
+        help="Print progress every N source images.",
     )
 
     args = parser.parse_args()
 
-    if not 0.0 < args.minimum_scale <= 1.0:
+    if not 0.0 <= args.minimum_scale <= 1.0:
         raise ValueError(
-            "minimum_scale must be in (0, 1]."
+            "minimum_scale must be between 0 and 1."
         )
 
     if not 0 <= args.jpeg_quality <= 100:
@@ -623,12 +540,7 @@ def main() -> None:
             "jpeg_quality must be between 0 and 100."
         )
 
-    (
-        _,
-        output_root,
-        severities,
-        selected,
-    ) = prepare_run(
+    _, output_root, severities, selected = prepare_run(
         input_root=args.input_root,
         output_root=args.output_root,
         severities_text=args.severities,
@@ -637,13 +549,8 @@ def main() -> None:
         seed=args.seed,
     )
 
-    index_path = (
-        output_root / "_resolution_index.csv"
-    )
-
-    written = 0
-    skipped = 0
-    unreadable = 0
+    index_path = output_root / "_resolution_index.csv"
+    written = skipped = unreadable = 0
 
     with index_path.open(
         "w",
@@ -651,7 +558,6 @@ def main() -> None:
         encoding="utf-8",
     ) as handle:
         writer = csv.writer(handle)
-
         writer.writerow(
             [
                 "crop",
@@ -667,10 +573,7 @@ def main() -> None:
             ]
         )
 
-        for number, row in enumerate(
-            selected,
-            start=1,
-        ):
+        for number, row in enumerate(selected, start=1):
             image = cv2.imread(
                 str(row.source_path),
                 cv2.IMREAD_COLOR,
@@ -678,34 +581,36 @@ def main() -> None:
 
             if image is None:
                 print(
-                    "WARNING: unreadable image skipped: "
-                    f"{row.source_path}"
+                    f"WARNING: unreadable image skipped: {row.source_path}"
                 )
                 unreadable += 1
                 continue
 
-            for severity in severities:
-                height, width = image.shape[:2]
+            height, width = image.shape[:2]
 
+            for severity in severities:
                 scale = scale_factor(
-                    severity=severity,
+                    severity,
                     minimum_scale=args.minimum_scale,
                 )
 
-                small_width = max(
-                    1,
-                    int(round(width * scale)),
-                )
-
-                small_height = max(
-                    1,
-                    int(round(height * scale)),
-                )
+                if severity >= 100 and args.minimum_scale == 0.0:
+                    small_width = 1
+                    small_height = 1
+                    scale = 0.0
+                else:
+                    small_width = max(
+                        1,
+                        int(round(width * scale)),
+                    )
+                    small_height = max(
+                        1,
+                        int(round(height * scale)),
+                    )
 
                 output_name = (
                     f"{row.source_path.stem}"
-                    f"_resolution_s"
-                    f"{severity_string(severity)}"
+                    f"_resolution_s{severity_string(severity)}"
                     f"_Sc{float_tag(scale, 4)}"
                     f"{row.source_path.suffix}"
                 )
@@ -717,7 +622,6 @@ def main() -> None:
                 )
 
                 corrupted = None
-
                 if severity > 0:
                     (
                         corrupted,
@@ -725,19 +629,19 @@ def main() -> None:
                         small_width,
                         small_height,
                     ) = degrade(
-                        image=image,
-                        severity=severity,
+                        image,
+                        severity,
+                        args.upsample_method,
                         minimum_scale=args.minimum_scale,
-                        upsample_method=args.upsample_method,
                     )
 
                 status = write_or_copy(
-                    source_path=row.source_path,
-                    output_path=output_path,
-                    severity=severity,
-                    corrupted=corrupted,
-                    overwrite=args.overwrite,
-                    jpeg_quality=args.jpeg_quality,
+                    row.source_path,
+                    output_path,
+                    severity,
+                    corrupted,
+                    args.overwrite,
+                    args.jpeg_quality,
                 )
 
                 written += status == "written"
@@ -768,19 +672,14 @@ def main() -> None:
                 )
             ):
                 print(
-                    f"Processed {number:,}/"
-                    f"{len(selected):,} "
+                    f"Processed {number:,}/{len(selected):,} "
                     f"source images."
                 )
 
     print("\nResolution generation complete.")
     print(f"Files written: {written:,}")
-    print(
-        f"Existing files skipped: {skipped:,}"
-    )
-    print(
-        f"Unreadable source images: {unreadable:,}"
-    )
+    print(f"Existing files skipped: {skipped:,}")
+    print(f"Unreadable source images: {unreadable:,}")
     print(f"Index: {index_path}")
 
 
