@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
-"""Generate sampled PlantVillage lighting corruptions for all classes.
+"""Generate the full sampled lighting-corruption dataset.
 
-Default behavior exactly matches corruption_gen_test/lighting.py and its
-normalized severity tables.
+Standalone version matching the other dataset generators:
+- processes every direct class folder under --input-root
+- weighted reproducible sampling per class
+- at least 100 images per class when available
+- severities 0, 10, ..., 100 by default
+- preserves true-label class folders
+- severity 0 is copied exactly
+- writes _lighting_index.csv
+- requires no configuration/helper file
 
-The prior standalone lighting controls and filename/index structure are
-retained. Passing --legacy-spatial-formula uses the previous configurable
-spatial multiplier formula; without that flag, the repository-matched
-luminance-based corruption is used.
+The lighting formula and values are copied from the approved preview script.
 """
 
 from __future__ import annotations
@@ -15,9 +19,9 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import math
 import random
 import shutil
-from bisect import bisect_right
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -25,37 +29,24 @@ import cv2
 import numpy as np
 
 
+# =====================================================================
+# LOCKED LIGHTING SETTINGS FROM THE APPROVED PREVIEW
+# =====================================================================
+PATTERN = "diagonal"
+SEVERITY_GAMMA = 2.00
+HIGHLIGHT_STOPS = 7.00
+SHADOW_STOPS = 8.00
+FIELD_CONTRAST = 0.55
+REGION_POWER = 0.80
+IMAGE_MAP_WEIGHT = 0.35
+TEMPERATURE_SHIFT = 0.06
+GLARE_STRENGTH = 0.08
+# =====================================================================
+
+
 VALID_EXTENSIONS = {
     ".jpg", ".jpeg", ".png", ".bmp",
     ".tif", ".tiff", ".webp",
-}
-
-LIGHTING_PUSH_TABLE = {
-    0: 0.00,
-    10: 0.10,
-    20: 0.20,
-    30: 0.30,
-    40: 0.40,
-    50: 0.50,
-    60: 0.60,
-    70: 0.70,
-    80: 0.80,
-    90: 0.90,
-    100: 1.00,
-}
-
-LIGHTING_BW_BLEND_TABLE = {
-    0: 0.00,
-    10: 0.00,
-    20: 0.00,
-    30: 0.02,
-    40: 0.06,
-    50: 0.12,
-    60: 0.22,
-    70: 0.36,
-    80: 0.54,
-    90: 0.76,
-    100: 1.00,
 }
 
 
@@ -73,14 +64,6 @@ def clamp(value: float, low: float, high: float) -> float:
 
 def severity_string(value: float) -> str:
     return f"{int(round(value)):03d}"
-
-
-def float_tag(value: float, decimals: int = 2) -> str:
-    return (
-        f"{value:.{decimals}f}"
-        .replace("-", "m")
-        .replace(".", "p")
-    )
 
 
 def stable_integer(text: str) -> int:
@@ -115,60 +98,12 @@ def parse_severities(text: str) -> list[int]:
     return severities
 
 
-def interpolate_table(table: dict[int, float], severity: float) -> float:
-    severity = clamp(float(severity), 0.0, 100.0)
-    keys = sorted(table)
-
-    if severity <= keys[0]:
-        return float(table[keys[0]])
-
-    if severity >= keys[-1]:
-        return float(table[keys[-1]])
-
-    exact = int(severity)
-    if float(severity).is_integer() and exact in table:
-        return float(table[exact])
-
-    upper_index = bisect_right(keys, severity)
-    lower_key = keys[upper_index - 1]
-    upper_key = keys[upper_index]
-
-    fraction = (
-        (severity - lower_key)
-        / (upper_key - lower_key)
-    )
-
-    return (
-        float(table[lower_key])
-        + fraction
-        * (
-            float(table[upper_key])
-            - float(table[lower_key])
-        )
-    )
-
-
-def get_lighting_push(severity: float) -> float:
-    return clamp(
-        interpolate_table(LIGHTING_PUSH_TABLE, severity),
-        0.0,
-        1.0,
-    )
-
-
-def get_lighting_bw_blend(severity: float) -> float:
-    return clamp(
-        interpolate_table(LIGHTING_BW_BLEND_TABLE, severity),
-        0.0,
-        1.0,
-    )
-
-
 def calculate_sample_count(
     class_size: int,
     minimum_per_class: int,
     sampling_fraction: float,
 ) -> int:
+    """Use the same weighted rule as the other generators."""
     if class_size <= 0:
         return 0
 
@@ -182,19 +117,14 @@ def calculate_sample_count(
 
 
 def find_class_directories(input_root: Path) -> list[Path]:
-    return sorted(
-        path
-        for path in input_root.iterdir()
-        if path.is_dir()
-    )
+    return sorted(path for path in input_root.iterdir() if path.is_dir())
 
 
 def find_images(class_directory: Path) -> list[Path]:
     return sorted(
         path
         for path in class_directory.iterdir()
-        if path.is_file()
-        and path.suffix.lower() in VALID_EXTENSIONS
+        if path.is_file() and path.suffix.lower() in VALID_EXTENSIONS
     )
 
 
@@ -214,12 +144,8 @@ def select_images_for_class(
     if sample_count >= len(images):
         return list(images)
 
-    rng = random.Random(
-        seed + stable_integer(class_name)
-    )
-    return sorted(
-        rng.sample(images, sample_count)
-    )
+    rng = random.Random(seed + stable_integer(class_name))
+    return sorted(rng.sample(images, sample_count))
 
 
 def prepare_run(
@@ -234,20 +160,13 @@ def prepare_run(
     output_root = output_root.expanduser().resolve()
 
     if not input_root.exists():
-        raise FileNotFoundError(
-            f"Input root does not exist: {input_root}"
-        )
-
+        raise FileNotFoundError(f"Input root does not exist: {input_root}")
     if not input_root.is_dir():
         raise NotADirectoryError(
             f"Input root is not a directory: {input_root}"
         )
-
     if minimum_per_class < 1:
-        raise ValueError(
-            "minimum_per_class must be at least 1."
-        )
-
+        raise ValueError("minimum_per_class must be at least 1.")
     if not 0.0 < sampling_fraction <= 1.0:
         raise ValueError(
             "sampling_fraction must be greater than 0 and at most 1."
@@ -270,9 +189,7 @@ def prepare_run(
         images = find_images(class_directory)
 
         if not images:
-            print(
-                f"WARNING: no supported images in {class_directory}"
-            )
+            print(f"WARNING: no supported images in {class_directory}")
             continue
 
         chosen = select_images_for_class(
@@ -299,9 +216,7 @@ def prepare_run(
             )
 
     if not selected:
-        raise RuntimeError(
-            "No images were selected for generation."
-        )
+        raise RuntimeError("No images were selected for generation.")
 
     return input_root, output_root, severities, selected
 
@@ -328,48 +243,64 @@ def ensure_bgr(image: np.ndarray) -> np.ndarray:
         if image.shape[2] == 3:
             return image
 
-    raise ValueError(
-        f"Unsupported image shape: {image.shape}"
-    )
+    raise ValueError(f"Unsupported image shape: {image.shape}")
 
 
-def force_odd(value: float) -> int:
-    value = max(3, int(round(value)))
-    if value % 2 == 0:
-        value += 1
-    return value
+def force_odd(value: float, minimum: int = 3) -> int:
+    number = max(minimum, int(round(value)))
+    return number if number % 2 == 1 else number + 1
 
 
-def create_repo_lighting_map(
-    image: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
+def spatial_field(
+    height: int,
+    width: int,
+    pattern: str,
+) -> np.ndarray:
+    """Create the same broad signed field as the preview program."""
+    x = np.linspace(-1.0, 1.0, width, dtype=np.float32)
+    y = np.linspace(-1.0, 1.0, height, dtype=np.float32)
+    xx, yy = np.meshgrid(x, y)
+
+    if pattern == "diagonal":
+        field = 0.5 * (xx + yy)
+    elif pattern == "horizontal":
+        field = xx
+    elif pattern == "vertical":
+        field = yy
+    elif pattern == "radial":
+        radius = np.sqrt(xx**2 + yy**2) / math.sqrt(2.0)
+        field = 1.0 - 2.0 * radius
+    elif pattern == "vignette":
+        radius = np.sqrt(xx**2 + yy**2) / math.sqrt(2.0)
+        field = 2.0 * radius - 1.0
+    else:
+        raise ValueError(
+            "PATTERN must be diagonal, horizontal, vertical, "
+            "radial, or vignette."
+        )
+
+    return np.clip(field, -1.0, 1.0).astype(np.float32)
+
+
+def image_luminance_field(image: np.ndarray) -> np.ndarray:
+    """Estimate broad existing luminance exactly as in the preview."""
     image = ensure_bgr(image)
     height, width = image.shape[:2]
     minimum_dimension = min(height, width)
 
-    lab = cv2.cvtColor(
-        image,
-        cv2.COLOR_BGR2LAB,
-    )
-
-    luminance = (
-        lab[:, :, 0].astype(np.float32)
-        / 255.0
-    )
+    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+    luminance = lab[:, :, 0].astype(np.float32) / 255.0
 
     sigma = float(
         np.clip(
-            minimum_dimension * 0.035,
-            3.0,
-            35.0,
+            minimum_dimension * 0.08,
+            8.0,
+            45.0,
         )
     )
+    kernel_size = force_odd(6.0 * sigma + 1.0)
 
-    kernel_size = force_odd(
-        6.0 * sigma + 1.0
-    )
-
-    smoothed = cv2.GaussianBlur(
+    smooth = cv2.GaussianBlur(
         luminance,
         (kernel_size, kernel_size),
         sigmaX=sigma,
@@ -377,209 +308,136 @@ def create_repo_lighting_map(
         borderType=cv2.BORDER_REFLECT101,
     )
 
-    low = float(np.percentile(smoothed, 2))
-    high = float(np.percentile(smoothed, 98))
+    low = float(np.percentile(smooth, 5))
+    high = float(np.percentile(smooth, 95))
 
     if high - low < 1e-6:
-        normalized_map = np.full_like(
-            smoothed,
-            0.5,
-            dtype=np.float32,
-        )
-    else:
-        normalized_map = (
-            (smoothed - low)
-            / (high - low)
-        )
-        normalized_map = np.clip(
-            normalized_map,
-            0.0,
-            1.0,
-        ).astype(np.float32)
+        return np.zeros_like(smooth, dtype=np.float32)
 
-    signed_map = (
-        2.0 * normalized_map - 1.0
-    ).astype(np.float32)
-
-    return normalized_map, signed_map
-
-
-def apply_repo_lighting(
-    image: np.ndarray,
-    severity: float,
-) -> tuple[np.ndarray, float, float]:
-    image = ensure_bgr(image)
-    severity = clamp(float(severity), 0.0, 100.0)
-
-    if severity <= 0:
-        return image.copy(), 0.0, 0.0
-
-    push = clamp(
-        get_lighting_push(severity),
-        0.0,
-        1.5,
-    )
-
-    bw_blend = clamp(
-        get_lighting_bw_blend(severity),
+    normalized = np.clip(
+        (smooth - low) / (high - low),
         0.0,
         1.0,
     )
 
-    image_float = image.astype(np.float32)
-    normalized_map, signed_map = (
-        create_repo_lighting_map(image)
-    )
+    return (2.0 * normalized - 1.0).astype(np.float32)
 
-    region_strength = (
-        np.abs(signed_map) ** 0.55
+
+def create_illumination_field(image: np.ndarray) -> np.ndarray:
+    """Create the same continuous illumination mask as the preview."""
+    image = ensure_bgr(image)
+    height, width = image.shape[:2]
+
+    geometric = spatial_field(height, width, PATTERN)
+    existing = image_luminance_field(image)
+
+    field = (
+        (1.0 - IMAGE_MAP_WEIGHT) * geometric
+        + IMAGE_MAP_WEIGHT * existing
     ).astype(np.float32)
 
-    signed_map_3 = signed_map[:, :, None]
-    strength_3 = region_strength[:, :, None]
+    sigma = float(
+        np.clip(
+            min(height, width) * 0.025,
+            3.0,
+            18.0,
+        )
+    )
+    kernel_size = force_odd(6.0 * sigma + 1.0)
 
-    bright_weight = (
-        np.clip(signed_map_3, 0.0, 1.0)
-        * strength_3
+    field = cv2.GaussianBlur(
+        field,
+        (kernel_size, kernel_size),
+        sigmaX=sigma,
+        sigmaY=sigma,
+        borderType=cv2.BORDER_REFLECT101,
     )
 
-    dark_weight = (
-        np.clip(-signed_map_3, 0.0, 1.0)
-        * strength_3
-    )
+    maximum = float(np.max(np.abs(field)))
+    if maximum > 1e-6:
+        field = field / maximum
 
-    bright_change = (
-        push
-        * bright_weight
-        * (255.0 - image_float)
-    )
+    field = np.clip(field, -1.0, 1.0)
 
-    dark_change = (
-        push
-        * dark_weight
-        * image_float
-    )
-
-    illumination_image = np.clip(
-        image_float
-        + bright_change
-        - dark_change,
-        0.0,
-        255.0,
-    )
-
-    binary_mask = normalized_map >= 0.5
-
-    binary_gray = np.where(
-        binary_mask,
-        255.0,
-        0.0,
+    denominator = math.tanh(FIELD_CONTRAST)
+    smooth_field = (
+        np.tanh(FIELD_CONTRAST * field) / denominator
     ).astype(np.float32)
 
-    binary_target = np.repeat(
-        binary_gray[:, :, None],
-        3,
-        axis=2,
-    )
+    shaped_field = (
+        np.sign(smooth_field)
+        * np.power(np.abs(smooth_field), REGION_POWER)
+    ).astype(np.float32)
 
-    corrupted = (
-        (1.0 - bw_blend) * illumination_image
-        + bw_blend * binary_target
-    )
-
-    if severity >= 100:
-        corrupted = binary_target.copy()
-
-    corrupted = np.clip(
-        corrupted,
-        0.0,
-        255.0,
-    ).astype(np.uint8)
-
-    return ensure_bgr(corrupted), push, bw_blend
+    return np.clip(shaped_field, -1.0, 1.0)
 
 
-def spatial_pattern(
-    height: int,
-    width: int,
-    pattern: str,
-) -> np.ndarray:
-    x = np.linspace(0, 1, width, dtype=np.float32)
-    y = np.linspace(0, 1, height, dtype=np.float32)
-    xx, yy = np.meshgrid(x, y)
-
-    if pattern == "diagonal":
-        values = 0.5 * (xx + yy)
-    elif pattern == "horizontal":
-        values = xx
-    elif pattern == "vertical":
-        values = yy
-    elif pattern in {"radial", "vignette"}:
-        distance = np.sqrt(
-            (xx - 0.5) ** 2
-            + (yy - 0.5) ** 2
-        )
-        maximum = np.sqrt(0.5**2 + 0.5**2)
-        values = 1.0 - distance / maximum
-
-        if pattern == "vignette":
-            values = 1.0 - values
-    else:
-        raise ValueError(
-            "pattern must be diagonal, horizontal, vertical, "
-            "radial, or vignette."
-        )
-
-    return np.clip(values, 0, 1).astype(np.float32)
-
-
-def apply_legacy_lighting(
+def apply_realistic_lighting(
     image: np.ndarray,
     severity: float,
-    minimum_multiplier: float,
-    maximum_multiplier: float,
-    sharpness: float,
-    pattern_name: str,
-) -> np.ndarray:
-    height, width = image.shape[:2]
-    alpha = clamp(severity, 0, 100) / 100.0
-    pattern = spatial_pattern(
-        height,
-        width,
-        pattern_name,
+) -> tuple[np.ndarray, dict[str, float]]:
+    """Apply the exact approved normalized lighting formula."""
+    image = ensure_bgr(image)
+    severity = clamp(float(severity), 0.0, 100.0)
+
+    if severity <= 0:
+        return image.copy(), {
+            "normalized_strength": 0.0,
+            "highlight_stops": 0.0,
+            "shadow_stops": 0.0,
+        }
+
+    normalized = (severity / 100.0) ** SEVERITY_GAMMA
+    field = create_illumination_field(image)
+
+    light_shadow_blend = (field + 1.0) / 2.0
+
+    exposure_map = normalized * (
+        -SHADOW_STOPS
+        + (HIGHLIGHT_STOPS + SHADOW_STOPS)
+        * light_shadow_blend
     )
 
-    split = 1.0 / (
-        1.0
-        + np.exp(
-            -sharpness * (pattern - 0.5)
-        )
-    )
+    image_float = image.astype(np.float32) / 255.0
 
-    target = (
-        minimum_multiplier
-        + (
-            maximum_multiplier
-            - minimum_multiplier
-        )
-        * split
-    )
+    exposure_multiplier = np.power(
+        2.0,
+        exposure_map,
+    ).astype(np.float32)[:, :, None]
 
-    multiplier = (
-        (1.0 - alpha)
-        + alpha * target
-    )
+    transformed = image_float * exposure_multiplier
 
-    if image.ndim == 3:
-        multiplier = multiplier[:, :, None]
+    light_weight = light_shadow_blend
+    shadow_weight = 1.0 - light_shadow_blend
 
-    result = image.astype(np.float32) * multiplier
+    warm = TEMPERATURE_SHIFT * normalized * light_weight
+    cool = TEMPERATURE_SHIFT * normalized * shadow_weight
 
-    return np.clip(
-        result,
-        0,
-        255,
+    # OpenCV uses BGR channel order.
+    transformed[:, :, 2] *= 1.0 + 0.30 * warm - 0.08 * cool
+    transformed[:, :, 1] *= 1.0 + 0.08 * warm
+    transformed[:, :, 0] *= 1.0 - 0.15 * warm + 0.20 * cool
+
+    glare_weight = np.clip(field, 0.0, 1.0)
+    glare = (
+        GLARE_STRENGTH
+        * (normalized**2.0)
+        * (glare_weight**2.0)
+    )[:, :, None]
+
+    transformed = transformed + glare * (1.0 - transformed)
+
+    output_bgr = np.clip(
+        transformed * 255.0,
+        0.0,
+        255.0,
     ).astype(np.uint8)
+
+    return output_bgr, {
+        "normalized_strength": normalized,
+        "highlight_stops": normalized * HIGHLIGHT_STOPS,
+        "shadow_stops": normalized * SHADOW_STOPS,
+    }
 
 
 def save_cv_image(
@@ -621,7 +479,10 @@ def save_cv_image(
     if not success:
         raise IOError(f"OpenCV failed to encode: {path}")
 
-    encoded.tofile(str(path))
+    try:
+        encoded.tofile(str(path))
+    except OSError as error:
+        raise IOError(f"Failed to save: {path}") from error
 
 
 def write_or_copy(
@@ -650,11 +511,11 @@ def write_or_copy(
     return "written"
 
 
-def main() -> None:
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Create a sampled 11-level PlantVillage lighting dataset "
-            "using corruption_gen_test severity by default."
+            "using the approved continuous normalized formula."
         )
     )
 
@@ -674,7 +535,7 @@ def main() -> None:
         "--severities",
         type=str,
         default="0,10,20,30,40,50,60,70,80,90,100",
-        help="Comma-separated severity levels.",
+        help="Comma-separated severity levels. Default: 0,10,...,100",
     )
     parser.add_argument(
         "--minimum-per-class",
@@ -686,69 +547,19 @@ def main() -> None:
         "--sampling-fraction",
         type=float,
         default=0.086,
-        help="Weighted class sampling fraction.",
+        help="Weighted class sampling fraction. Default: 0.086",
     )
     parser.add_argument(
         "--seed",
         type=int,
         default=2026,
-        help="Random seed for reproducible sampling.",
-    )
-    parser.add_argument(
-        "--minimum-multiplier",
-        type=float,
-        default=0.0,
-        help=(
-            "Retained for the optional legacy spatial formula. "
-            "Ignored by the default repository-matched formula."
-        ),
-    )
-    parser.add_argument(
-        "--maximum-multiplier",
-        type=float,
-        default=6.0,
-        help=(
-            "Retained for the optional legacy spatial formula. "
-            "Ignored by the default repository-matched formula."
-        ),
-    )
-    parser.add_argument(
-        "--sharpness",
-        type=float,
-        default=12.0,
-        help=(
-            "Retained for the optional legacy spatial formula. "
-            "Ignored by the default repository-matched formula."
-        ),
-    )
-    parser.add_argument(
-        "--pattern",
-        choices=[
-            "diagonal",
-            "horizontal",
-            "vertical",
-            "radial",
-            "vignette",
-        ],
-        default="diagonal",
-        help=(
-            "Retained for the optional legacy spatial formula. "
-            "Ignored by the default repository-matched formula."
-        ),
-    )
-    parser.add_argument(
-        "--legacy-spatial-formula",
-        action="store_true",
-        help=(
-            "Use the previous configurable spatial multiplier formula "
-            "instead of the default repository-matched severity."
-        ),
+        help="Random seed for reproducible sampling. Default: 2026",
     )
     parser.add_argument(
         "--jpeg-quality",
         type=int,
         default=95,
-        help="JPEG quality.",
+        help="JPEG output quality. Default: 95",
     )
     parser.add_argument(
         "--overwrite",
@@ -759,25 +570,32 @@ def main() -> None:
         "--progress-every",
         type=int,
         default=25,
-        help="Print progress every N source images.",
+        help="Print progress every N source images. Default: 25",
     )
 
-    args = parser.parse_args()
+    return parser.parse_args()
 
-    if args.maximum_multiplier < args.minimum_multiplier:
-        raise ValueError(
-            "maximum_multiplier must be >= minimum_multiplier."
-        )
 
-    if args.sharpness <= 0:
-        raise ValueError(
-            "sharpness must be positive."
-        )
+def print_settings() -> None:
+    print("\nLOCKED LIGHTING SETTINGS")
+    print("=" * 56)
+    print(f"PATTERN:             {PATTERN}")
+    print(f"SEVERITY_GAMMA:      {SEVERITY_GAMMA}")
+    print(f"HIGHLIGHT_STOPS:     {HIGHLIGHT_STOPS}")
+    print(f"SHADOW_STOPS:        {SHADOW_STOPS}")
+    print(f"FIELD_CONTRAST:      {FIELD_CONTRAST}")
+    print(f"REGION_POWER:        {REGION_POWER}")
+    print(f"IMAGE_MAP_WEIGHT:    {IMAGE_MAP_WEIGHT}")
+    print(f"TEMPERATURE_SHIFT:   {TEMPERATURE_SHIFT}")
+    print(f"GLARE_STRENGTH:      {GLARE_STRENGTH}")
+    print("=" * 56)
+
+
+def main() -> None:
+    args = parse_args()
 
     if not 0 <= args.jpeg_quality <= 100:
-        raise ValueError(
-            "jpeg_quality must be between 0 and 100."
-        )
+        raise ValueError("jpeg_quality must be between 0 and 100.")
 
     _, output_root, severities, selected = prepare_run(
         input_root=args.input_root,
@@ -788,18 +606,12 @@ def main() -> None:
         seed=args.seed,
     )
 
+    print_settings()
+
     index_path = output_root / "_lighting_index.csv"
     written = skipped = unreadable = 0
 
-    min_tag = float_tag(args.minimum_multiplier, 2)
-    max_tag = float_tag(args.maximum_multiplier, 2)
-    sharp_tag = float_tag(args.sharpness, 2)
-
-    with index_path.open(
-        "w",
-        newline="",
-        encoding="utf-8",
-    ) as handle:
+    with index_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
         writer.writerow(
             [
@@ -808,18 +620,21 @@ def main() -> None:
                 "source_relative_path",
                 "output_relative_path",
                 "severity",
-                "minimum_multiplier",
-                "maximum_multiplier",
-                "sharpness",
+                "normalized_strength",
+                "highlight_stops",
+                "shadow_stops",
                 "pattern",
+                "severity_gamma",
+                "field_contrast",
+                "region_power",
+                "image_map_weight",
+                "temperature_shift",
+                "glare_strength",
             ]
         )
 
         for number, row in enumerate(selected, start=1):
-            image = cv2.imread(
-                str(row.source_path),
-                cv2.IMREAD_COLOR,
-            )
+            image = cv2.imread(str(row.source_path), cv2.IMREAD_COLOR)
 
             if image is None:
                 print(
@@ -832,10 +647,6 @@ def main() -> None:
                 output_name = (
                     f"{row.source_path.stem}"
                     f"_lighting_s{severity_string(severity)}"
-                    f"_min{min_tag}"
-                    f"_max{max_tag}"
-                    f"_sh{sharp_tag}"
-                    f"_{args.pattern}"
                     f"{row.source_path.suffix}"
                 )
 
@@ -845,31 +656,26 @@ def main() -> None:
                     output_name,
                 )
 
-                corrupted = None
-
                 if severity > 0:
-                    if args.legacy_spatial_formula:
-                        corrupted = apply_legacy_lighting(
-                            image=image,
-                            severity=severity,
-                            minimum_multiplier=args.minimum_multiplier,
-                            maximum_multiplier=args.maximum_multiplier,
-                            sharpness=args.sharpness,
-                            pattern_name=args.pattern,
-                        )
-                    else:
-                        corrupted, _, _ = apply_repo_lighting(
-                            image,
-                            severity,
-                        )
+                    corrupted, parameters = apply_realistic_lighting(
+                        image,
+                        severity,
+                    )
+                else:
+                    corrupted = None
+                    parameters = {
+                        "normalized_strength": 0.0,
+                        "highlight_stops": 0.0,
+                        "shadow_stops": 0.0,
+                    }
 
                 status = write_or_copy(
-                    row.source_path,
-                    output_path,
-                    severity,
-                    corrupted,
-                    args.overwrite,
-                    args.jpeg_quality,
+                    source_path=row.source_path,
+                    output_path=output_path,
+                    severity=severity,
+                    corrupted=corrupted,
+                    overwrite=args.overwrite,
+                    jpeg_quality=args.jpeg_quality,
                 )
 
                 written += status == "written"
@@ -880,14 +686,18 @@ def main() -> None:
                         row.crop,
                         row.class_name,
                         row.relative_path.as_posix(),
-                        output_path
-                        .relative_to(output_root)
-                        .as_posix(),
+                        output_path.relative_to(output_root).as_posix(),
                         severity,
-                        args.minimum_multiplier,
-                        args.maximum_multiplier,
-                        args.sharpness,
-                        args.pattern,
+                        f"{parameters['normalized_strength']:.8f}",
+                        f"{parameters['highlight_stops']:.8f}",
+                        f"{parameters['shadow_stops']:.8f}",
+                        PATTERN,
+                        SEVERITY_GAMMA,
+                        FIELD_CONTRAST,
+                        REGION_POWER,
+                        IMAGE_MAP_WEIGHT,
+                        TEMPERATURE_SHIFT,
+                        GLARE_STRENGTH,
                     ]
                 )
 
@@ -900,7 +710,7 @@ def main() -> None:
             ):
                 print(
                     f"Processed {number:,}/{len(selected):,} "
-                    f"source images."
+                    "source images."
                 )
 
     print("\nLighting generation complete.")

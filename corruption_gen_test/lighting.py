@@ -1,120 +1,183 @@
+#!/usr/bin/env python3
+"""
+Preview a smooth, normalized lighting-corruption sequence.
+
+Generates:
+    severity 0, 20, 50, 80, and 100
+plus a labeled contact sheet.
+
+The lighting mask is continuous across the entire image:
+- no coverage floor,
+- no np.where split,
+- no binary black/white endpoint,
+- no unused highlight/shadow parameters.
+
+The values in the EDITABLE SETTINGS section directly control the pixels.
+"""
+
+from __future__ import annotations
+
 import argparse
 import math
-import os
+from pathlib import Path
 
 import cv2
 import numpy as np
 
-import normalized_severity as ns
+
+# =====================================================================
+# EDITABLE SETTINGS
+# Change values only in this section while calibrating the formula.
+# =====================================================================
+
+# Preview severity levels.
+PREVIEW_SEVERITIES = (0, 20, 50, 80, 100)
+
+# Broad spatial lighting pattern:
+# "diagonal", "horizontal", "vertical", "radial", or "vignette"
+PATTERN = "diagonal"
+
+# Controls how rapidly corruption grows from severity 0 to 100.
+# Higher values keep low severities milder while preserving severity 100.
+# Suggested range: 1.4 to 2.2
+SEVERITY_GAMMA = 2.00
+
+# Maximum positive exposure at severity 100, in photographic stops.
+# +1 stop = 2x brightness; +5 stops = 32x brightness before clipping.
+# Increase this to blow out more of the bright side.
+# Suggested range: 3.0 to 7.0
+HIGHLIGHT_STOPS = 7.00
+
+# Maximum negative exposure at severity 100, in photographic stops.
+# -1 stop = 1/2 brightness; -6 stops = 1/64 brightness.
+# Increase this to make the shadow side darker.
+# Suggested range: 4.0 to 8.0
+SHADOW_STOPS = 8.00
+
+# Controls the smoothness of the light-to-shadow transition.
+# Lower values produce a broader, softer transition.
+# Higher values produce stronger separation.
+# Suggested range: 0.35 to 1.20
+FIELD_CONTRAST = 0.55
+
+# Reshapes the smooth signed field without creating a hard boundary.
+# 1.0 keeps the field unchanged.
+# Above 1.0 creates a wider neutral middle.
+# Below 1.0 spreads stronger effects over more of the image.
+# Suggested range: 0.8 to 1.4
+REGION_POWER = 0.80
+
+# Weight of the image's existing broad luminance in the illumination map.
+# 0.0 uses only the geometric pattern.
+# Higher values make the effect follow existing broad light/dark regions.
+# Suggested range: 0.0 to 0.35
+IMAGE_MAP_WEIGHT = 0.35
+
+# Mild warm shift in bright areas and cool shift in shadows.
+# Set to 0.0 for no color-temperature shift.
+# Suggested range: 0.0 to 0.08
+TEMPERATURE_SHIFT = 0.06
+
+# Adds a soft white veil only in the strongest illuminated regions.
+# Suggested range: 0.0 to 0.08
+GLARE_STRENGTH = 0.08
+
+# Contact-sheet appearance.
+CONTACT_CELL_WIDTH = 300
+CONTACT_CELL_HEIGHT = 300
+
+# =====================================================================
+# END EDITABLE SETTINGS
+# =====================================================================
 
 
-SEVERITIES = getattr(
-    ns,
-    "SEVERITIES",
-    list(range(0, 101, 10)),
-)
+def clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
 
 
-def read_image(path):
-    """
-    Read an image as a three-channel BGR image.
-    """
-
-    image = cv2.imread(path, cv2.IMREAD_COLOR)
-
-    if image is None:
-        raise FileNotFoundError(
-            f"Could not read image: {path}\n"
-            "Check the path, filename, and extension."
-        )
-
-    return image
-
-
-def ensure_directory(path):
-    os.makedirs(path, exist_ok=True)
-
-
-def ensure_bgr(image):
-    """
-    Guarantee that an image has exactly three BGR channels.
-    """
-
+def ensure_bgr(image: np.ndarray) -> np.ndarray:
     if image.ndim == 2:
         return cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
 
     if image.ndim == 3:
         if image.shape[2] == 1:
             return cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
-
         if image.shape[2] == 4:
             return cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
-
         if image.shape[2] == 3:
             return image
 
-    raise ValueError(
-        f"Unsupported image shape: {image.shape}"
-    )
+    raise ValueError(f"Unsupported image shape: {image.shape}")
 
 
-def force_odd(value):
+def force_odd(value: float, minimum: int = 3) -> int:
+    number = max(minimum, int(round(value)))
+    return number if number % 2 == 1 else number + 1
+
+
+def spatial_field(
+    height: int,
+    width: int,
+    pattern: str,
+) -> np.ndarray:
     """
-    Convert a number to a positive odd integer.
+    Create a broad signed field in approximately [-1, 1].
+
+    +1 represents the strongest illuminated region.
+    -1 represents the strongest shaded region.
     """
+    x = np.linspace(-1.0, 1.0, width, dtype=np.float32)
+    y = np.linspace(-1.0, 1.0, height, dtype=np.float32)
+    xx, yy = np.meshgrid(x, y)
 
-    value = max(3, int(round(value)))
+    if pattern == "diagonal":
+        field = 0.5 * (xx + yy)
 
-    if value % 2 == 0:
-        value += 1
+    elif pattern == "horizontal":
+        field = xx
 
-    return value
+    elif pattern == "vertical":
+        field = yy
+
+    elif pattern == "radial":
+        radius = np.sqrt(xx**2 + yy**2) / math.sqrt(2.0)
+        field = 1.0 - 2.0 * radius
+
+    elif pattern == "vignette":
+        radius = np.sqrt(xx**2 + yy**2) / math.sqrt(2.0)
+        field = 2.0 * radius - 1.0
+
+    else:
+        raise ValueError(
+            "PATTERN must be diagonal, horizontal, vertical, "
+            "radial, or vignette."
+        )
+
+    return np.clip(field, -1.0, 1.0).astype(np.float32)
 
 
-def create_lighting_map(image):
+def image_luminance_field(image: np.ndarray) -> np.ndarray:
     """
-    Create a smooth illumination map using the image's existing luminance.
-
-    Broad bright regions receive positive values.
-    Broad dark regions receive negative values.
-
-    Returns:
-        normalized_map:
-            Luminance values normalized to approximately 0–1.
-
-        signed_map:
-            Dark regions near -1 and bright regions near +1.
+    Estimate broad existing illumination while suppressing leaf texture,
+    veins, lesions, and small pixel-level detail.
     """
-
     image = ensure_bgr(image)
-
     height, width = image.shape[:2]
     minimum_dimension = min(height, width)
 
-    lab = cv2.cvtColor(
-        image,
-        cv2.COLOR_BGR2LAB,
-    )
+    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+    luminance = lab[:, :, 0].astype(np.float32) / 255.0
 
-    luminance = (
-        lab[:, :, 0].astype(np.float32) / 255.0
-    )
-
-    # Broad smoothing helps the corruption follow realistic illumination
-    # regions rather than individual leaf edges or pixel noise.
     sigma = float(
         np.clip(
-            minimum_dimension * 0.035,
-            3.0,
-            35.0,
+            minimum_dimension * 0.08,
+            8.0,
+            45.0,
         )
     )
+    kernel_size = force_odd(6.0 * sigma + 1.0)
 
-    kernel_size = force_odd(
-        6.0 * sigma + 1.0
-    )
-
-    smoothed = cv2.GaussianBlur(
+    smooth = cv2.GaussianBlur(
         luminance,
         (kernel_size, kernel_size),
         sigmaX=sigma,
@@ -122,189 +185,257 @@ def create_lighting_map(image):
         borderType=cv2.BORDER_REFLECT101,
     )
 
-    # Percentile normalization prevents isolated extreme pixels from
-    # controlling the entire lighting map.
-    low = float(np.percentile(smoothed, 2))
-    high = float(np.percentile(smoothed, 98))
+    low = float(np.percentile(smooth, 5))
+    high = float(np.percentile(smooth, 95))
 
     if high - low < 1e-6:
-        normalized_map = np.full_like(
-            smoothed,
-            0.5,
-            dtype=np.float32,
-        )
-    else:
-        normalized_map = (
-            smoothed - low
-        ) / (
-            high - low
-        )
+        return np.zeros_like(smooth, dtype=np.float32)
 
-        normalized_map = np.clip(
-            normalized_map,
-            0.0,
-            1.0,
-        ).astype(np.float32)
+    normalized = np.clip(
+        (smooth - low) / (high - low),
+        0.0,
+        1.0,
+    )
 
-    signed_map = (
-        2.0 * normalized_map - 1.0
+    return (2.0 * normalized - 1.0).astype(np.float32)
+
+
+def create_illumination_field(
+    image: np.ndarray,
+    pattern: str,
+    image_map_weight: float,
+    field_contrast: float,
+    region_power: float,
+) -> np.ndarray:
+    """
+    Create one smooth signed illumination field covering the full image.
+
+    The result remains continuous; no threshold divides light and shadow.
+    """
+    image = ensure_bgr(image)
+    height, width = image.shape[:2]
+
+    image_map_weight = clamp(image_map_weight, 0.0, 1.0)
+
+    geometric = spatial_field(height, width, pattern)
+    existing = image_luminance_field(image)
+
+    field = (
+        (1.0 - image_map_weight) * geometric
+        + image_map_weight * existing
     ).astype(np.float32)
 
-    return normalized_map, signed_map
-
-
-def apply_lighting_degradation(image, severity):
-    """
-    Apply harsh illumination corruption.
-
-    Behavior:
-        Severity 0:
-            Original image.
-
-        Increasing severity:
-            Existing bright regions move toward white.
-            Existing dark regions move toward black.
-
-        Severity 100:
-            A pure black-and-white, three-channel BGR image.
-
-    The parameter values are obtained from normalized_severity.py.
-    """
-
-    image = ensure_bgr(image)
-
-    severity = float(
-        np.clip(severity, 0, 100)
+    sigma = float(
+        np.clip(
+            min(height, width) * 0.025,
+            3.0,
+            18.0,
+        )
     )
+    kernel_size = force_odd(6.0 * sigma + 1.0)
+
+    field = cv2.GaussianBlur(
+        field,
+        (kernel_size, kernel_size),
+        sigmaX=sigma,
+        sigmaY=sigma,
+        borderType=cv2.BORDER_REFLECT101,
+    )
+
+    maximum = float(np.max(np.abs(field)))
+    if maximum > 1e-6:
+        field = field / maximum
+
+    field = np.clip(field, -1.0, 1.0)
+
+    if field_contrast <= 0:
+        raise ValueError("FIELD_CONTRAST must be positive.")
+
+    # Smoothly reshape the field while preserving endpoints and continuity.
+    denominator = math.tanh(field_contrast)
+    smooth_field = (
+        np.tanh(field_contrast * field)
+        / denominator
+    ).astype(np.float32)
+
+    if region_power <= 0:
+        raise ValueError("REGION_POWER must be positive.")
+
+    shaped_field = (
+        np.sign(smooth_field)
+        * np.power(
+            np.abs(smooth_field),
+            region_power,
+        )
+    ).astype(np.float32)
+
+    return np.clip(
+        shaped_field,
+        -1.0,
+        1.0,
+    )
+
+
+def apply_realistic_lighting(
+    image: np.ndarray,
+    severity: float,
+) -> tuple[np.ndarray, dict[str, float]]:
+    """
+    Apply a continuous uneven-exposure corruption.
+
+    Normalized severity:
+        n = (severity / 100)^SEVERITY_GAMMA
+
+    Smooth light/shadow blend:
+        blend = (field + 1) / 2
+
+    Exposure in stops:
+        exposure =
+            n * [
+                -SHADOW_STOPS
+                + (HIGHLIGHT_STOPS + SHADOW_STOPS) * blend
+            ]
+
+    Pixel transform:
+        output = input * 2^exposure
+
+    HIGHLIGHT_STOPS and SHADOW_STOPS directly control the saved pixels.
+    """
+    image = ensure_bgr(image)
+    severity = clamp(float(severity), 0.0, 100.0)
 
     if severity <= 0:
-        return image.copy(), 0.0, 0.0
+        return image.copy(), {
+            "normalized_strength": 0.0,
+            "highlight_stops": 0.0,
+            "shadow_stops": 0.0,
+        }
 
-    push = float(
-        ns.get_lighting_push(severity)
-    )
+    if SEVERITY_GAMMA <= 0:
+        raise ValueError("SEVERITY_GAMMA must be positive.")
 
-    bw_blend = float(
-        ns.get_lighting_bw_blend(severity)
-    )
-
-    push = float(
-        np.clip(push, 0.0, 1.5)
-    )
-
-    bw_blend = float(
-        np.clip(bw_blend, 0.0, 1.0)
-    )
-
-    image_float = image.astype(np.float32)
-
-    normalized_map, signed_map = (
-        create_lighting_map(image)
-    )
-
-    # Strengthen middle-valued regions slightly so changes are visible
-    # throughout the severity sequence.
-    region_strength = (
-        np.abs(signed_map) ** 0.55
-    ).astype(np.float32)
-
-    # Convert maps from H x W to H x W x 1.
-    signed_map_3 = signed_map[:, :, None]
-    strength_3 = region_strength[:, :, None]
-
-    bright_weight = (
-        np.clip(
-            signed_map_3,
-            0.0,
-            1.0,
+    if HIGHLIGHT_STOPS < 0 or SHADOW_STOPS < 0:
+        raise ValueError(
+            "HIGHLIGHT_STOPS and SHADOW_STOPS must be nonnegative."
         )
-        * strength_3
+
+    normalized = (
+        severity / 100.0
+    ) ** SEVERITY_GAMMA
+
+    field = create_illumination_field(
+        image=image,
+        pattern=PATTERN,
+        image_map_weight=IMAGE_MAP_WEIGHT,
+        field_contrast=FIELD_CONTRAST,
+        region_power=REGION_POWER,
     )
 
-    dark_weight = (
-        np.clip(
-            -signed_map_3,
-            0.0,
-            1.0,
+    # Continuous 0-to-1 blend across the entire image.
+    light_shadow_blend = (
+        field + 1.0
+    ) / 2.0
+
+    exposure_map = normalized * (
+        -SHADOW_STOPS
+        + (
+            HIGHLIGHT_STOPS
+            + SHADOW_STOPS
         )
-        * strength_3
+        * light_shadow_blend
     )
 
-    # Bright regions move toward white.
-    bright_change = (
-        push
-        * bright_weight
-        * (255.0 - image_float)
+    # Work directly in normalized OpenCV BGR space.
+    image_float = (
+        image.astype(np.float32)
+        / 255.0
     )
 
-    # Dark regions move toward black.
-    dark_change = (
-        push
-        * dark_weight
-        * image_float
-    )
+    # Convert photographic stops into actual brightness multipliers.
+    exposure_multiplier = np.power(
+        2.0,
+        exposure_map,
+    ).astype(np.float32)[:, :, None]
 
-    illumination_image = (
+    transformed = (
         image_float
-        + bright_change
-        - dark_change
+        * exposure_multiplier
     )
 
-    illumination_image = np.clip(
-        illumination_image,
+    # Soft continuous color-temperature weights.
+    light_weight = light_shadow_blend
+    shadow_weight = 1.0 - light_shadow_blend
+
+    warm = (
+        TEMPERATURE_SHIFT
+        * normalized
+        * light_weight
+    )
+
+    cool = (
+        TEMPERATURE_SHIFT
+        * normalized
+        * shadow_weight
+    )
+
+    # OpenCV channel order is BGR.
+    transformed[:, :, 2] *= (
+        1.0
+        + 0.30 * warm
+        - 0.08 * cool
+    )
+
+    transformed[:, :, 1] *= (
+        1.0
+        + 0.08 * warm
+    )
+
+    transformed[:, :, 0] *= (
+        1.0
+        - 0.15 * warm
+        + 0.20 * cool
+    )
+
+    # Glare is limited to the more illuminated side.
+    glare_weight = np.clip(
+        field,
         0.0,
-        255.0,
+        1.0,
     )
 
-    # Create a two-dimensional black-and-white target.
-    binary_mask = normalized_map >= 0.5
+    glare = (
+        GLARE_STRENGTH
+        * (normalized**2.0)
+        * (glare_weight**2.0)
+    )[:, :, None]
 
-    binary_gray = np.where(
-        binary_mask,
-        255.0,
-        0.0,
-    ).astype(np.float32)
-
-    # Convert H x W grayscale target into H x W x 3.
-    binary_target = np.repeat(
-        binary_gray[:, :, None],
-        3,
-        axis=2,
+    transformed = (
+        transformed
+        + glare * (1.0 - transformed)
     )
 
-    # Gradually transition toward the black-and-white endpoint.
-    corrupted = (
-        (1.0 - bw_blend) * illumination_image
-        + bw_blend * binary_target
-    )
-
-    if severity >= 100:
-        # Guarantee severity 100 contains only black and white and
-        # remains a three-channel BGR image.
-        corrupted = binary_target.copy()
-
-    corrupted = np.clip(
-        corrupted,
+    output_bgr = np.clip(
+        transformed * 255.0,
         0.0,
         255.0,
     ).astype(np.uint8)
 
-    corrupted = ensure_bgr(corrupted)
-
-    return corrupted, push, bw_blend
+    return output_bgr, {
+        "normalized_strength": normalized,
+        "highlight_stops": (
+            normalized * HIGHLIGHT_STOPS
+        ),
+        "shadow_stops": (
+            normalized * SHADOW_STOPS
+        ),
+    }
 
 
 def resize_for_cell(
-    image,
-    available_width,
-    available_height,
-):
-    """
-    Resize an image while preserving its aspect ratio.
-    """
-
-    image = ensure_bgr(image)
-
+    image: np.ndarray,
+    available_width: int,
+    available_height: int,
+) -> np.ndarray:
     height, width = image.shape[:2]
 
     scale = min(
@@ -325,101 +456,80 @@ def resize_for_cell(
     interpolation = (
         cv2.INTER_AREA
         if scale < 1.0
-        else cv2.INTER_NEAREST
+        else cv2.INTER_LINEAR
     )
 
-    resized = cv2.resize(
+    return cv2.resize(
         image,
         (new_width, new_height),
         interpolation=interpolation,
     )
 
-    return ensure_bgr(resized)
-
 
 def create_contact_sheet(
-    labeled_images,
-    columns=3,
-    cell_width=300,
-    cell_height=260,
-):
-    """
-    Create a contact sheet from three-channel BGR images.
-    """
-
-    rows = math.ceil(
-        len(labeled_images) / columns
-    )
+    labeled_images: list[tuple[str, np.ndarray]],
+) -> np.ndarray:
+    columns = len(labeled_images)
 
     sheet = np.full(
         (
-            rows * cell_height,
-            columns * cell_width,
+            CONTACT_CELL_HEIGHT,
+            columns * CONTACT_CELL_WIDTH,
             3,
         ),
-        255,
+        245,
         dtype=np.uint8,
     )
 
-    for index, (label, image) in enumerate(
-        labeled_images
-    ):
-        image = ensure_bgr(image)
-
-        row = index // columns
-        column = index % columns
-
-        x_start = column * cell_width
-        y_start = row * cell_height
-
+    for index, (label, image) in enumerate(labeled_images):
         preview = resize_for_cell(
-            image,
-            available_width=cell_width - 20,
-            available_height=cell_height - 55,
+            ensure_bgr(image),
+            available_width=CONTACT_CELL_WIDTH - 20,
+            available_height=CONTACT_CELL_HEIGHT - 55,
         )
 
-        preview = ensure_bgr(preview)
-
-        preview_height, preview_width = (
-            preview.shape[:2]
-        )
+        preview_height, preview_width = preview.shape[:2]
+        x_start = index * CONTACT_CELL_WIDTH
 
         x_offset = (
             x_start
-            + (cell_width - preview_width) // 2
+            + (CONTACT_CELL_WIDTH - preview_width) // 2
         )
 
         y_offset = (
-            y_start
-            + 42
+            42
             + (
-                cell_height
+                CONTACT_CELL_HEIGHT
                 - 42
                 - preview_height
             ) // 2
         )
 
-        destination = sheet[
+        sheet[
             y_offset:y_offset + preview_height,
             x_offset:x_offset + preview_width,
-        ]
+        ] = preview
 
-        if destination.shape != preview.shape:
-            raise ValueError(
-                "Contact-sheet shape mismatch:\n"
-                f"Destination: {destination.shape}\n"
-                f"Preview: {preview.shape}"
-            )
+        text_size, _ = cv2.getTextSize(
+            label,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.52,
+            1,
+        )
 
-        destination[:] = preview
+        text_width = text_size[0]
 
         cv2.putText(
             sheet,
             label,
-            (x_start + 8, y_start + 27),
+            (
+                x_start
+                + (CONTACT_CELL_WIDTH - text_width) // 2,
+                27,
+            ),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.48,
-            (0, 0, 0),
+            0.52,
+            (20, 20, 20),
             1,
             cv2.LINE_AA,
         )
@@ -427,111 +537,138 @@ def create_contact_sheet(
     return sheet
 
 
-def main():
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Generate normalized harsh-illumination "
-            "corruption at severities 0, 10, ..., 100."
+            "Generate normalized lighting previews using the constants "
+            "in the EDITABLE SETTINGS section."
         )
     )
 
     parser.add_argument(
         "image",
-        help="Path to the input image.",
+        type=Path,
+        help="Path to one clean source image.",
     )
 
     parser.add_argument(
-        "--output_dir",
-        default="lighting_test",
-        help=(
-            "Directory used to save generated images. "
-            "Default: lighting_test"
-        ),
+        "--output-dir",
+        type=Path,
+        default=Path("realistic_lighting_preview"),
+        help="Output directory.",
     )
 
-    args = parser.parse_args()
+    return parser.parse_args()
 
-    image = read_image(args.image)
-    ensure_directory(args.output_dir)
 
-    base_name = os.path.splitext(
-        os.path.basename(args.image)
-    )[0]
+def print_settings() -> None:
+    print("\nACTIVE EDITABLE SETTINGS")
+    print("=" * 55)
+    print(f"PREVIEW_SEVERITIES:  {PREVIEW_SEVERITIES}")
+    print(f"PATTERN:             {PATTERN}")
+    print(f"SEVERITY_GAMMA:      {SEVERITY_GAMMA}")
+    print(f"HIGHLIGHT_STOPS:     {HIGHLIGHT_STOPS}")
+    print(f"SHADOW_STOPS:        {SHADOW_STOPS}")
+    print(f"FIELD_CONTRAST:      {FIELD_CONTRAST}")
+    print(f"REGION_POWER:        {REGION_POWER}")
+    print(f"IMAGE_MAP_WEIGHT:    {IMAGE_MAP_WEIGHT}")
+    print(f"TEMPERATURE_SHIFT:   {TEMPERATURE_SHIFT}")
+    print(f"GLARE_STRENGTH:      {GLARE_STRENGTH}")
+    print("=" * 55)
+    print()
 
-    contact_images = []
 
-    for severity in SEVERITIES:
-        corrupted, push, bw_blend = (
-            apply_lighting_degradation(
-                image,
-                severity,
-            )
+def main() -> None:
+    args = parse_args()
+
+    print("\nRUNNING SCRIPT:")
+    print(Path(__file__).resolve())
+
+    print_settings()
+
+    image_path = args.image.expanduser().resolve()
+    output_dir = args.output_dir.expanduser().resolve()
+
+    image = cv2.imread(
+        str(image_path),
+        cv2.IMREAD_COLOR,
+    )
+
+    if image is None:
+        raise FileNotFoundError(
+            f"Could not read image: {image_path}"
+        )
+
+    output_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    labeled_images: list[tuple[str, np.ndarray]] = []
+
+    for severity in PREVIEW_SEVERITIES:
+        corrupted, parameters = apply_realistic_lighting(
+            image=image,
+            severity=severity,
         )
 
         output_name = (
-            f"{base_name}_lighting_"
-            f"s{int(severity):03d}.png"
+            f"{image_path.stem}"
+            f"_realistic_lighting_s{severity:03d}.png"
         )
 
-        output_path = os.path.join(
-            args.output_dir,
-            output_name,
-        )
+        output_path = output_dir / output_name
 
-        success = cv2.imwrite(
-            output_path,
+        if not cv2.imwrite(
+            str(output_path),
             corrupted,
-        )
-
-        if not success:
+        ):
             raise IOError(
                 f"Failed to save: {output_path}"
             )
 
-        parameter_text = (
-            f"push={push:.2f}, "
-            f"BW={bw_blend:.2f}"
-        )
+        if severity == 0:
+            label = "Severity 0"
+        else:
+            label = (
+                f"Severity {severity} | "
+                f"+{parameters['highlight_stops']:.2f}/"
+                f"-{parameters['shadow_stops']:.2f} EV"
+            )
 
-        label = (
-            f"Severity {int(severity)} | "
-            f"{parameter_text}"
-        )
-
-        contact_images.append(
+        labeled_images.append(
             (label, corrupted)
         )
 
         print(
-            f"Saved severity {int(severity)}: "
-            f"{output_path} "
-            f"({parameter_text}, "
-            f"shape={corrupted.shape})"
+            f"Saved severity {severity}: {output_path} "
+            f"(n={parameters['normalized_strength']:.4f}, "
+            f"highlight=+{parameters['highlight_stops']:.3f} EV, "
+            f"shadow=-{parameters['shadow_stops']:.3f} EV)"
         )
 
     contact_sheet = create_contact_sheet(
-        contact_images
+        labeled_images
     )
 
-    contact_sheet_path = os.path.join(
-        args.output_dir,
-        f"{base_name}_lighting_contact_sheet.png",
+    contact_sheet_path = (
+        output_dir
+        / (
+            f"{image_path.stem}"
+            f"_realistic_lighting_contact_sheet.png"
+        )
     )
 
-    success = cv2.imwrite(
-        contact_sheet_path,
+    if not cv2.imwrite(
+        str(contact_sheet_path),
         contact_sheet,
-    )
-
-    if not success:
+    ):
         raise IOError(
-            f"Failed to save contact sheet: "
-            f"{contact_sheet_path}"
+            f"Failed to save: {contact_sheet_path}"
         )
 
     print(
-        f"\nContact sheet: "
-        f"{contact_sheet_path}"
+        f"\nContact sheet: {contact_sheet_path}"
     )
 
 
